@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: geosyncai
+      POSTGRES_USER: geosyncai
+      POSTGRES_PASSWORD: geosyncai
+    ports: ["5432:5432"]
+    volumes: ["geosyncai_pgdata:/var/lib/postgresql/data"]
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://geosyncai:geosyncai@postgres:5432/geosyncai
+      JWT_SECRET: change-this-in-production
+      STORAGE_DIR: /app/storage
+    ports: ["8000:8000"]
+    volumes: ["geosyncai_storage:/app/storage"]
+    depends_on: [postgres]
+volumes:
+  geosyncai_pgdata:
+  geosyncai_storage:

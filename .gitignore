@@ -1,0 +1,31 @@
+# Local/private workspace state
+.opencode/
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+backend/storage/
+backend/tests/storage/
+
+# Node/Vite
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

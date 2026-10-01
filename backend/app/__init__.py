@@ -1,0 +1,1 @@
+"""GeoSyncAI backend application."""
