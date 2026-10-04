@@ -1,14 +1,15 @@
 import os
 import sys
+import tempfile
 from pathlib import Path
 
-TEST_DB = Path(__file__).parent / "test.db"
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
-os.environ["STORAGE_DIR"] = str(Path(__file__).parent / "storage")
+TEST_ROOT = Path(tempfile.mkdtemp(prefix="geosyncai-tests-"))
+TEST_DB = TEST_ROOT / "test.db"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", f"sqlite:///{TEST_DB.as_posix()}")
+os.environ["STORAGE_DIR"] = str(TEST_ROOT / "storage")
 os.environ["JWT_SECRET"] = "test-secret-longer-than-thirty-two-bytes"
 os.environ["AUTO_BOOTSTRAP"] = "true"
+os.environ['CELERY_BROKER_URL'] = ''
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import pytest

@@ -1,53 +1,84 @@
-"""Durable-job seam. Uses Celery when configured, otherwise FastAPI background work."""
+"""Transactional durable stages: side effects and completion commit together.
+
+A conditional UPDATE holds the job row lock until the stage commits. Duplicate
+workers wait and recheck succeeded status. A killed worker rolls back both the
+claim and effects, leaving the queued receipt recoverable.
+"""
 import threading
+import hashlib
+import json
 from datetime import datetime, timezone
+
 from fastapi import BackgroundTasks
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import select, update
+
 from .config import get_settings
 from .db import SessionLocal
-from .models import Job
+from .models import Job, Dataset
 from .services import run_change_detection, run_matching, run_topology
 
 
+def configuration_hash(db, job_type, payload):
+    from .policy import processing_policy
+    dataset = next((db.get(Dataset, str(v)) for k,v in payload.items() if k.endswith('dataset_id')), None)
+    if dataset and payload.get('policy_version', 0) != processing_policy(db, dataset.project_id)['version']:
+        raise ValueError("Processing policy changed; submit a new job")
+    ids = sorted({str(value) for key, value in payload.items() if key.endswith("dataset_id")})
+    inputs = []
+    for dataset_id in ids:
+        dataset = db.get(Dataset, dataset_id)
+        if not dataset:
+            raise ValueError("Job input no longer exists")
+        inputs.append((dataset.id, dataset.content_hash, dataset.declared_crs, dataset.schema_mapping_version))
+    return hashlib.sha256(json.dumps({"job_type": job_type, "payload": payload, "inputs": inputs,
+                                     "rules": "rules-v2"}, sort_keys=True).encode()).hexdigest()
+
+
 def execute_job(job_id: str) -> None:
-    db: Session = SessionLocal()
-    job = db.get(Job, job_id)
-    if not job:
-        db.close()
-        return
-    job.status = "running"
-    job.started_at = datetime.now(timezone.utc)
-    db.commit()
-    try:
-        payload = job.payload
-        if job.job_type == "match":
-            result = run_matching(db, job.project_id, payload["left_dataset_id"], payload["right_dataset_id"],
-                                  payload.get("id_fields", []), payload.get("max_distance", 75.0), payload.get("ambiguity_margin", 0.08))
-        elif job.job_type == "topology":
-            result = run_topology(db, job.project_id, payload["dataset_id"])
-        elif job.job_type == "change_detection":
-            result = run_change_detection(db, job.project_id, payload["before_dataset_id"], payload["after_dataset_id"],
-                                          payload.get("id_fields", []), payload.get("geometry_tolerance", 1e-8))
-        else:
-            raise ValueError(f"Unsupported job type: {job.job_type}")
-        job.status, job.result = "succeeded", result
-    except Exception as exc:  # durable receipt retains failure for later inspection
-        job.status, job.error = "failed", str(exc)
-    job.finished_at = datetime.now(timezone.utc)
-    db.commit()
-    db.close()
+    with SessionLocal() as db:
+        try:
+            claimed = db.execute(update(Job).where(Job.id == job_id, Job.status.in_(("queued", "running", "failed")))
+                                 .values(status="running", started_at=datetime.now(timezone.utc), attempts=Job.attempts + 1))
+            if not claimed.rowcount:
+                db.rollback()
+                return
+            job = db.get(Job, job_id)
+            if job.configuration_hash != configuration_hash(db, job.job_type, job.payload):
+                raise ValueError("Job input metadata or mapping changed; submit a new job with current inputs")
+            db.info["job_transaction"] = True
+            payload = job.payload
+            if job.job_type == "match":
+                result = run_matching(db, job.project_id, payload["left_dataset_id"], payload["right_dataset_id"],
+                                      payload.get("id_fields", []), payload.get("max_distance", 75.0),
+                                      payload.get("ambiguity_margin", 0.08), payload.get("namespace_fields", []))
+            elif job.job_type == "topology":
+                result = run_topology(db, job.project_id, payload["dataset_id"])
+            elif job.job_type == "change_detection":
+                result = run_change_detection(db, job.project_id, payload["before_dataset_id"], payload["after_dataset_id"],
+                                              payload.get("id_fields", []), payload.get("geometry_tolerance", 0.5))
+            else:
+                raise ValueError(f"Unsupported job type: {job.job_type}")
+            job.status, job.result, job.error = "succeeded", result, None
+            job.finished_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            # A failed receipt is persisted separately only after all stage
+            # effects have been rolled back. It never reports partial success.
+            db.execute(update(Job).where(Job.id == job_id, Job.status != "succeeded")
+                       .values(status="failed", error=str(exc), attempts=Job.attempts + 1,
+                               finished_at=datetime.now(timezone.utc)))
+            db.commit()
 
 
 settings = get_settings()
 celery_app = None
 if settings.celery_broker_url:
-    try:
-        from celery import Celery
-        celery_app = Celery("geosyncai", broker=settings.celery_broker_url)
-        celery_app.task(name="geosyncai.execute_job")(execute_job)
-    except ImportError:
-        celery_app = None
+    from celery import Celery
+    celery_app = Celery("geosyncai", broker=settings.celery_broker_url)
+    celery_app.conf.update(task_acks_late=True, task_reject_on_worker_lost=True,
+                           worker_prefetch_multiplier=1, broker_connection_retry_on_startup=True)
+    celery_app.task(name="geosyncai.execute_job")(execute_job)
 
 
 def dispatch_job(job_id: str, background: BackgroundTasks) -> None:
@@ -58,11 +89,10 @@ def dispatch_job(job_id: str, background: BackgroundTasks) -> None:
 
 
 def recover_jobs() -> None:
-    """Replay persisted queued/interrupted local jobs after an application restart."""
-    if celery_app:
-        return
-    db = SessionLocal()
-    job_ids = list(db.scalars(select(Job.id).where(Job.status.in_(("queued", "running")))))
-    db.close()
+    with SessionLocal() as db:
+        job_ids = list(db.scalars(select(Job.id).where(Job.status.in_(("queued", "running")))))
     for job_id in job_ids:
-        threading.Thread(target=execute_job, args=(job_id,), daemon=True).start()
+        if celery_app:
+            celery_app.send_task("geosyncai.execute_job", args=[job_id])
+        else:
+            threading.Thread(target=execute_job, args=(job_id,), daemon=True).start()

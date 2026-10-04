@@ -1,79 +1,63 @@
-# GeoSyncAI backend
+# Backend
 
-GeoSyncAI is a FastAPI prototype for explainable land-data harmonization. It
-keeps uploaded bytes unchanged, stores normalized source features separately,
-and makes uncertain matches and meaningful changes explicit review targets.
+FastAPI + SQLAlchemy; SQLite locally or PostgreSQL/PostGIS. Use the exact WSL,
+Compose, seeding and test commands in the root README. Python 3.12 is the verified
+runtime; Fiona wheels avoid requiring a system GDAL build in that environment.
 
-## Local run (SQLite)
+## Main routes
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
+All `/api/projects/{project_id}/...` routes require membership and check write/
+review permissions as applicable. Downloads have the same authorization checks.
 
-The default database is `sqlite:///./geosyncai.db` and raw files are kept under
-`./storage`. Set `DATABASE_URL` and `STORAGE_DIR` in `.env` to override them.
-The service creates tables on startup and seeds these demo users (passwords are
-the same as the usernames):
+| Route | Purpose |
+|---|---|
+| `POST /api/auth/token`, `GET /api/auth/me` | Login/current user |
+| `GET/POST /api/projects` | Scoped projects/create |
+| `POST .../members` | Admin membership management |
+| `GET/POST .../policy`, `GET .../history` | Versioned processing policy/audit history |
+| `POST .../datasets/upload` | Multipart file, organization, capture date, declared CRS, optional parent dataset UUID |
+| `GET .../datasets`, `GET .../datasets/{id}/features` | Quality and previews including quarantine |
+| `GET .../datasets/{id}/raw` | Original bytes |
+| `POST .../datasets/{id}/confirm-crs` | `{crs,reason}`; reprocess original geometry |
+| `GET/POST .../datasets/{id}/mapping` | Canonical-field → source-field mapping; confirmation/versioning |
+| `GET .../mapping-templates` | Reusable confirmed mappings within the project |
+| `POST .../match`, `.../topology/{id}`, `.../changes/detect` | Synchronous diagnostic stage routes |
+| `POST .../jobs?job_type=match\|topology\|change_detection` | Durable processing, input/config hashes, automatic idempotency |
+| `GET .../jobs/{id}`, `POST .../jobs/{id}/retry` | Receipt/retry |
+| `POST .../reviews/{match\|change\|conflict}/{id}` | Required `{decision,rationale,expected_revision}` |
+| `GET .../parcels` | Stable identities, source memberships and current baseline selections |
+| `POST .../parcels/{id}/selection` | Explicit geometry/attribute source selection and optional per-field overrides |
+| `POST .../features/{id}/baseline` | Explicit standalone baseline for an unmatched source |
+| `POST .../validate`, `POST .../publish` | Exact-candidate validation and immutable publication |
+| `GET .../versions`, `POST .../versions/{id}/rollback` | History/restore as new version |
+| `GET .../versions/{id}/export?format=...` | `geojson`, `gpkg`, `csv`, `quality`, `lineage` |
+| `GET .../exports/{format}` | Latest-version export shortcut |
 
-| username | password | role |
-|---|---|---|
-| viewer | viewer | viewer |
-| processor | processor | processor |
-| reviewer | reviewer | reviewer |
-| admin | admin | admin |
+GeoPackage accepts `output_crs=EPSG:32643` (or another supported CRS). GeoJSON
+always uses EPSG:4326 longitude/latitude. CSV has one row per source-to-canonical
+link. GeoPackage stores arbitrary source attributes and lineage in JSON text
+columns plus the stable parcel UUID and native geometry.
 
-Change all credentials and `JWT_SECRET` before any real deployment. Synthetic
-data is labelled and is not evidence of cadastral accuracy.
+## States and transaction boundaries
 
-## PostgreSQL/PostGIS
+`proposed` → `under_review` → `accepted` / `rejected` /
+`needs_field_verification`. Direct decisions from proposed are allowed.
+Deferred/field-verification items can return to review. Final decisions require
+new evidence for another revision. A stale expected revision returns HTTP 409.
 
-```powershell
-docker compose up --build
-```
+Accepted identities materialize source links; a separate reviewer selection
+controls the baseline. Validation does not silently approve proposals. Its hash
+covers candidate features, exclusions, mappings, inputs, policy and decisions.
+Publication requires the matching valid report. Source CRS/mapping changes
+invalidate unreviewed proposals; reviewed sources require a new dataset version.
 
-The compose API uses `postgresql+psycopg://...` and a PostGIS 3.4 database.
-The application retains GeoJSON-compatible geometry JSON for portability and,
-when the configured URL is PostgreSQL, enables PostGIS and stores normalized
-EPSG:4326 geometry in native GiST-indexed geometry columns through GeoAlchemy2.
+Each worker stage holds a conditional database row lock. Side effects and the
+succeeded receipt commit together. Failure rolls back effects before saving a
+failed receipt. Duplicate delivery of a successful job does no work. Interrupted
+transactions remain recoverable. In this prototype running state is transactional
+and may appear queued to other sessions until commit; no fabricated progress
+percentages are displayed. API startup redispatches queued/interrupted receipts.
 
-## Workflow endpoints
-
-- `POST /api/auth/token`, `GET /api/auth/me`
-- Project and membership APIs under `/api/projects`
-- Register or upload GeoJSON/CSV under `/api/projects/{id}/datasets`
-- `POST /api/projects/{id}/bootstrap-synthetic` for deterministic demo parcels
-- `POST /api/projects/{id}/match` for explainable rule-based proposals (including unmatched and ambiguous outcomes)
-- `POST /api/projects/{id}/topology/{dataset_id}` and `POST /api/projects/{id}/changes/detect`
-- `POST /api/projects/{id}/reviews/{match|change|conflict}/{target_id}` for reviewer decisions
-- `POST /api/projects/{id}/validate` to validate accepted changes and open topology errors
-- `POST /api/projects/{id}/publish` and `GET /api/projects/{id}/versions/{id}/export?format=geojson|csv|lineage`
-- `POST /api/projects/{id}/jobs` plus `GET /api/projects/{id}/jobs/{id}` for durable job receipts. Without
-  `CELERY_BROKER_URL`, FastAPI background tasks execute jobs locally; with a
-  broker, the Celery seam can be wired to a worker.
-
-For Celery, point `CELERY_BROKER_URL` at a supported broker and run:
-
-```powershell
-celery -A app.tasks.celery_app worker --loglevel=INFO
-```
-
-Uploads accept GeoJSON and CSV. CSV geometry can be GeoJSON, WKT, or longitude /
-latitude columns. Original upload bytes are content-addressed by SHA-256 and
-never replaced by normalized records. Unknown CRS is retained as an explicit
-warning and the dataset enters `needs_crs_review`.
-
-## Tests
-
-From the repository root:
-
-```powershell
-python -m pytest backend/tests -q
-```
-
-Tests use an isolated SQLite database and cover project authorization, raw
-upload preservation, and the invariant that unapproved boundary changes block
-publication.
+Alembic revisions are in `migrations/`; the original schema upgrade is additive.
+Historical versions remain snapshots. The audit log is application history, not
+legally certified immutability.

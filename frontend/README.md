@@ -1,58 +1,39 @@
-# GeoSyncAI officer workspace
+# Officer workspace frontend
 
-React + TypeScript + Vite frontend for the GeoSyncAI land-data harmonization workflow. The interface uses MapLibre GL JS for parcel visualization and integrates with a FastAPI service by default.
-
-## Run locally
-
-Requires Node.js 20.19+ (or 22.12+).
+React 19 + TypeScript + Vite + MapLibre. The existing forest/mint responsive visual
+system is retained in `src/styles.css`; the workspace now uses only live API state.
 
 ```bash
-cd frontend
-cp .env.example .env
-npm install
+npm ci
 npm run dev
-```
-
-Open <http://localhost:5173>. Set `VITE_API_BASE_URL` in `.env` if FastAPI is not served from `http://localhost:8000/api`.
-
-The login screen also exposes **Use local synthetic demo** when `VITE_ENABLE_DEMO_MOCK=true`. This mode is deliberately isolated in `src/mockApi.ts`, is visibly marked in the UI, and never implies a backend connection or real cadastral accuracy. Set the flag to `false` for API-only deployments.
-
-## Checks
-
-```bash
 npm run typecheck
 npm run build
-npm run preview
 ```
 
-## FastAPI contract
+`VITE_API_BASE_URL` defaults to `http://localhost:8000/api`. The Compose build uses
+`/api` through Nginx. Synthetic generation is an explicit backend action, not a
+frontend mock mode. No proprietary map token is required; vectors render on a
+local background by default. OpenStreetMap tiles are optional.
 
-The client uses bearer-token authentication and these JSON endpoints. List endpoints may return either a JSON array or an object wrapping that array under the shown plural key.
+## Views
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/auth/token` | Body `{ username, password }`; returns `{ access_token, user }` |
-| `GET` | `/projects` | List scoped projects |
-| `POST` | `/projects` | Create a project when none is available |
-| `GET` | `/projects/{id}/datasets` | Dataset registry and validation/CRS status |
-| `POST` | `/projects/{id}/datasets/upload` | Multipart upload under field `file` |
-| `POST` | `/projects/{id}/bootstrap-synthetic` | Create deterministic synthetic parcel datasets |
-| `POST` | `/projects/{id}/match` | Run explainable baseline matching |
-| `GET` | `/projects/{id}/matches` | Match proposals and evidence cards |
-| `POST` | `/projects/{id}/reviews/match/{proposal_id}` | Save reviewer decision and rationale |
-| `GET` | `/projects/{id}/changes` | Dated-snapshot change alerts |
-| `GET` | `/projects/{id}/versions` | Publication/version history |
-| `POST` | `/projects/{id}/validate` | Run publication checks |
-| `POST` | `/projects/{id}/publish` | Publish a reviewed version |
-| `GET` | `/projects/{id}/datasets/{dataset_id}/features` | Normalized source features for MapLibre |
-| `GET` | `/projects/{id}/exports/{geojson\|csv\|lineage}` | Export latest published output |
+- Overview: real current user, project creation/selection, live counts, explicit
+  synthetic setup, versioned policy and administrator membership controls.
+- Datasets: source upload/date/organization, original hash, quality/record preview,
+  CRS correction, mapping confirmation/reuse, pair selection and processing jobs.
+- Review: exact feature UUID selection, full polygon/multipolygon map geometry,
+  evidence/alternatives, rationale and stale-review handling, canonical baseline
+  and per-field attribute source selection.
+- Change alerts: dated vector proposals, before/after overlays and review.
+- Versions: validation failures/exclusions, publication, lineage inspection,
+  version-specific lineage download, GeoPackage CRS and traceable restore.
 
-The TypeScript response shapes are documented in `src/types.ts`. FastAPI must allow the Vite development origin in CORS. Authentication and project/download authorization remain backend responsibilities.
+`src/workflowApi.ts` defines live response shapes. `src/api.ts` handles bearer
+authentication, errors and downloads. Authorization is enforced by the backend;
+frontend disabled states are only usability hints. Original mock data and fallback
+square geometry have been removed.
 
-## Interface safeguards
-
-- Ranking scores are explicitly labeled **uncalibrated** and never described as probabilities.
-- Boundary-changing proposals require a visible before/after acknowledgement.
-- Missing CRS blocks spatial matching rather than silently assuming a system.
-- Accept/reject/defer decisions and review notes are presented as audit events.
-- Synthetic mode and synthetic exports are clearly labeled.
+The real browser acceptance test is `e2e/test_browser.py`, run from the repository
+root with the Python development dependencies and Playwright Chromium installed.
+It uses actual API uploads, CRS/mapping confirmation, review, publication/download
+and API restart, and checks a narrow-screen layout.

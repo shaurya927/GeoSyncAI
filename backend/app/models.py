@@ -35,6 +35,9 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    workflow_revision: Mapped[int] = mapped_column(Integer, default=0)
+    validated_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_report: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -61,6 +64,13 @@ class Dataset(Base):
     raw_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     declared_crs: Mapped[str | None] = mapped_column(String(120), nullable=True)
     normalized_crs: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    analysis_crs: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    crs_transform: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    crs_confirmed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    crs_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    access_classification: Mapped[str] = mapped_column(String(30), default="internal")
+    accuracy_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    schema_mapping_version: Mapped[int] = mapped_column(Integer, default=0)
     geometry_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="registered")
     record_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -78,6 +88,8 @@ class SourceFeature(Base):
     raw_attributes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     original_geometry: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     normalized_geometry: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    administrative_context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    canonical_attributes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     if POSTGIS:
         spatial_geometry: Mapped[Any | None] = mapped_column(
             Geometry(geometry_type="GEOMETRY", srid=4326, spatial_index=True), nullable=True
@@ -92,6 +104,47 @@ class ParcelEntity(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     canonical_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ParcelSelection(Base):
+    """Explicit reviewer-approved baseline, separate from identity decisions."""
+    __tablename__ = "parcel_selections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    parcel_entity_id: Mapped[str] = mapped_column(ForeignKey("parcel_entities.id"), unique=True)
+    geometry_source_id: Mapped[str | None] = mapped_column(ForeignKey("source_features.id"), nullable=True)
+    attribute_source_id: Mapped[str] = mapped_column(ForeignKey("source_features.id"))
+    attribute_sources: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    rationale: Mapped[str] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ParcelSourceLink(Base):
+    __tablename__ = "parcel_source_links"
+    __table_args__ = (UniqueConstraint("parcel_entity_id", "source_feature_id", name="uq_parcel_source_link"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    parcel_entity_id: Mapped[str] = mapped_column(ForeignKey("parcel_entities.id", ondelete="CASCADE"), index=True)
+    source_feature_id: Mapped[str] = mapped_column(ForeignKey("source_features.id", ondelete="CASCADE"), index=True)
+    match_proposal_id: Mapped[str | None] = mapped_column(ForeignKey("match_proposals.id"), nullable=True)
+    link_status: Mapped[str] = mapped_column(String(30), default="accepted")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SchemaMapping(Base):
+    __tablename__ = "schema_mappings"
+    __table_args__ = (UniqueConstraint("dataset_id", "version", name="uq_dataset_schema_mapping_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), default="draft")
+    mapping: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    source_fields: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -106,6 +159,7 @@ class MatchProposal(Base):
     status: Mapped[str] = mapped_column(String(40), default="proposed")
     candidate_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model_version: Mapped[str] = mapped_column(String(80), default="rules-v1")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -121,6 +175,7 @@ class TopologyConflict(Base):
     description: Mapped[str] = mapped_column(Text)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="open")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -136,8 +191,10 @@ class ChangeProposal(Base):
     before_attributes: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     after_attributes: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     area_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    affected_neighbors: Mapped[list[str]] = mapped_column(JSON, default=list)
     boundary_change: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(40), default="proposed")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -151,6 +208,8 @@ class ReviewDecision(Base):
     actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     decision: Mapped[str] = mapped_column(String(40))
     rationale: Mapped[str] = mapped_column(Text)
+    expected_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_revision: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -162,6 +221,10 @@ class PublishedVersion(Base):
     version_number: Mapped[int] = mapped_column(Integer)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     status: Mapped[str] = mapped_column(String(30), default="published")
+    project_revision: Mapped[int] = mapped_column(Integer, default=0)
+    base_version_id: Mapped[str | None] = mapped_column(ForeignKey("published_versions.id"), nullable=True)
+    excluded_records: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    validation_report: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     lineage_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -192,6 +255,8 @@ class Job(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    configuration_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

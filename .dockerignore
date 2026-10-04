@@ -1,0 +1,10 @@
+.git
+.opencode
+**/.env
+**/.venv
+**/node_modules
+**/dist
+**/__pycache__
+**/*.db
+backend/storage
+backend/tests/storage

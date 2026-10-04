@@ -75,8 +75,9 @@ def ensure_project_access(db: Session, project_id: str, user: User, write: bool 
     member = db.scalar(select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id))
     if not member:
         raise HTTPException(status_code=403, detail="Project access denied")
-    if review and user.role != "reviewer":
+    project_role = member.project_role
+    if review and (user.role != "reviewer" or project_role not in {"reviewer", "owner"}):
         raise HTTPException(status_code=403, detail="Reviewer role required")
-    if write and user.role not in {"processor", "reviewer"}:
+    if write and (user.role not in {"processor", "reviewer"} or project_role not in {"processor", "reviewer", "owner"}):
         raise HTTPException(status_code=403, detail="Write access denied")
     return project

@@ -1,0 +1,44 @@
+name: Acceptance
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: geosyncai_test
+          POSTGRES_USER: geosyncai
+          POSTGRES_PASSWORD: isolated-ci-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U geosyncai -d geosyncai_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: pip install -r backend/requirements-dev.txt
+      - run: npm ci
+        working-directory: frontend
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest backend/tests -q
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://geosyncai:isolated-ci-password@localhost:5432/geosyncai_test
+          BROKER_TEST_URL: redis://localhost:6379/15
+      - run: python -m pytest e2e -q
+        env:
+          E2E_DATABASE_URL: postgresql+psycopg://geosyncai:isolated-ci-password@localhost:5432/geosyncai_test
+      - run: npm run typecheck && npm run build
+        working-directory: frontend

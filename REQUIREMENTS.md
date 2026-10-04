@@ -1,62 +1,56 @@
-# GeoSyncAI requirement status
+# Requirement status
 
-Status reflects this workspace, not a claim about the official SIH submission
-or real-world cadastral accuracy.
+Status refers to this working tree, not an SIH certification. **Tested** means the
+named acceptance path ran; it is not proof of every production edge case.
 
-## Required demonstration functionality
-
-| Requirement | Status | Evidence / boundary |
+| Capability | Status | Evidence / remaining boundary |
 |---|---|---|
-| Browser-based responsive officer workspace | Implemented | React + TypeScript + Vite, responsive CSS, and MapLibre map |
-| Authentication | Implemented | JWT bearer tokens with viewer/processor/reviewer/admin accounts |
-| Project-scoped permissions | Implemented | Backend membership checks on reads, writes, reviews, queries, and exports |
-| Multi-source ingestion | Implemented | GeoJSON, CSV, GeoPackage, and safe SHP ZIP ingestion paths |
-| Preserve original source records | Implemented | Immutable raw upload path and SHA-256 hash; normalized features are separate |
-| Format and archive validation | Implemented | Parser checks, required SHP components, safe ZIP paths, readable GeoPackage layers |
-| Schema and record validation | Implemented | Schema field report, duplicate IDs, empty/invalid geometry, processed/quarantined counts |
-| CRS validation and normalization | Implemented | Declared/embedded CRS parsing and PROJ transformation; unresolved CRS is explicit |
-| Explicit unmatched outcome | Implemented | Match proposals may remain `unmatched`; no forced nearest-neighbor link |
-| Explainable candidate matching | Implemented | Identifier agreement, IoU, centroid distance, area difference, alternatives |
-| Separate score and review dimensions | Implemented | Uncalibrated rule score, spatial evidence, data quality, and review status are distinct |
-| Ambiguity and abstention | Implemented | Configurable ambiguity margin routes close candidates to review |
-| Attribute-only revenue records | Implemented | CSV rows without geometry remain processed; spatial evidence is explicitly unavailable |
-| Attribute mapping | Partial | Curated aliases and raw fields exist; reusable reviewed mapping-template editor is not included |
-| Topology/conflict detection | Implemented | Invalid geometry and overlaps; dated attribute/geometry change records |
-| Reversible change proposals | Implemented | Before/after geometry and attributes, area delta, tolerance, and evidence retained |
-| Authorized boundary approval | Implemented | Reviewer role required; boundary changes block publication until accepted and validated |
-| Officer review decisions | Implemented | Accept/reject/defer and rationale persisted as review records |
-| Validation before publication | Implemented | Accepted change geometry and open topology errors are checked |
-| Versioned publication | Implemented | Immutable numbered versions with lineage manifests |
-| Full publication lineage | Implemented | Dataset/hash, source feature, accepted changes, and review decision IDs retained |
-| GeoJSON/CSV/lineage export | Implemented | Latest-version browser exports and version-specific export route |
-| Dated vector change detection | Implemented | Added/missing/attribute/geometry changes with tolerance evidence |
-| Background jobs | Implemented | Durable job records, restart recovery, local background fallback, optional Celery seam |
-| PostgreSQL/PostGIS persistence | Implemented | Compose PostGIS image and native geometry columns/GiST when configured |
-| Reproducible synthetic data | Implemented | Deterministic labelled parcel pair with non-legal-evidence warning |
-| Honest evaluation reporting | Implemented as safeguard | No fabricated benchmark or accuracy result is shown |
+| Responsive web workspace, real API | Tested | Chromium/PostGIS workflow plus mobile-width check; no mock fallback |
+| Login, actual current user, project selection/create | Tested | Browser workflow; JWT roles and memberships |
+| Dataset uploads and immutable originals | Tested | GeoJSON, CSV, SHP ZIP, GeoPackage; bytes/hash retained |
+| Archive/resource validation | Implemented | Upload, expanded-size/member-count, path/symlink/ratio checks; not a fuzzing claim |
+| Record quality and quarantine inspection | Tested | Invalid geometry retained in previews/topology; no silent normalization discard |
+| Dataset versions/metadata | Implemented/partial | Parent UUID, organization/date/hash/classification/accuracy fields; full metadata editing UI remains limited |
+| CRS correction and publication gates | Tested | Impossible coordinates rejected; correction preserves raw input; reviewed sources use new versions |
+| Metric analysis | Tested locally | Local UTM, strict PROJ, operation/grid/software lineage; wide-area/polar policy remains limited |
+| Polygon/MultiPolygon display | Implemented | Full geometry retained; no first-polygon truncation or origin-square fallback |
+| Confirmed, versioned, reusable schema mapping | Tested core | Mapping affects canonical identifier/namespace semantics; templates reuse within project |
+| Candidate ranking and administrative context | Tested | Metric STRtree, semantic ID/context, IoU/distance/area/boundary evidence, alternatives |
+| Shared-number/distant/competing candidates | Tested | Abstention and one-to-one membership checks |
+| Split/merge handling | Partial | Detected/routed to field verification; approved split/merge editing is not implemented |
+| Topology | Tested core | Invalid, duplicate, containment/overlap; explicit coverage gaps implemented |
+| Shared-boundary reconstruction | Partial | Overlap/gap signals; no general boundary repair engine |
+| Source precedence | Implemented | Explicit geometry/default attribute source and per-field reviewer overrides; no universal source hierarchy |
+| Review state machine and concurrency | Tested | Mandatory expected revision, atomic stale-review rejection, role caps |
+| Stable canonical parcel identities | Tested | Accepted source membership; separate baseline approval; stable UUID across publications |
+| Boundary rejection/defer policy | Tested | Reject retains baseline; pending/deferred selected changes block |
+| Resulting candidate/neighborhood validation | Tested | Exact fingerprint and current policy; overlap checks on assembled canonical geometries |
+| Immutable versions, lineage, exclusions | Tested | Included sources/hashes/mappings/CRS/matches/reviews/selections; unselected reasons |
+| Dated identity-linked vector changes | Tested core | Explicit chronological pair, metric tolerance; duplicates/splits abstain; missing does not imply demolition |
+| Durable jobs | Tested | Rollback of stage side effects, retry and duplicate delivery; actual Redis/Celery worker |
+| Job telemetry | Partial | Durable receipts/stages, no fake progress; running state may remain externally queued until transaction commits |
+| GeoJSON/GeoPackage/CSV/quality/lineage exports | Tested core | Reopened geometry/CRS/JSON attributes; CSV one row per source link |
+| Traceable rollback | Tested | New version, old snapshot retained |
+| Migrations and restart persistence | Tested | Original-schema additive upgrade; browser retrieves publication after API restart |
+| PostgreSQL/PostGIS native geometry/GiST | Tested | Native PostgreSQL 18.6 / PostGIS 3.6.2 integration |
+| Full Compose deployment | Configured; smoke blocked | Docker unavailable locally; target images/ports/volumes/health checks and CI added |
+| Secure defaults and opt-in seed | Implemented | Required JWT secret outside demo, explicit seeding, pinned Python/Node dependencies |
+| Synthetic evaluation pack | Generated/measured | ~1,000 parcels, separate answer key, checksums/vertices/dependencies/results in docs |
+| Accuracy/effort objectives | Targets, not generally achieved claims | Scoped synthetic metrics only; schema-suggestion accuracy/manual savings not measured |
 
-## Roadmap or explicitly out of scope
+## Actual verification
 
-| Item | Status |
-|---|---|
-| CAD, scans, point clouds, drone/RINEX processing | Not implemented; separate integrations |
-| Ground-control-point legacy-map transformation | Not implemented |
-| Learned ranker, embeddings, calibration, reliability plots | Not claimed; MVP uses deterministic rules |
-| GNN/graph matcher | Not implemented |
-| Imagery change detection | Not implemented |
-| Offline field synchronization / installable PWA | Not implemented; responsive browser access is delivered |
-| Production OGC API Features conformance | Not claimed; exports are implemented |
-| Government API integrations | Not implemented; require authorized access |
-| Kubernetes/GPU/distributed production scaling | Not implemented; Compose prototype only |
-| Blockchain, Aadhaar, citizen portal, predictive values, chatbot, AR, 3D | Explicitly outside MVP |
+- **23 backend tests passed** against real PostGIS and Redis/Celery.
+- **1 Chromium E2E passed** against the real PostGIS API, including download and restart.
+- Frontend typecheck/build passed; MapLibre bundle warning remains.
+- Latest synthetic evaluation: **14.0621 seconds**, including simulated review.
+- Detailed commands, environment versions, denominators and limitations:
+  [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
-## Known external dependencies and limitations
+## Roadmap / unavailable
 
-- PostgreSQL/PostGIS Compose configuration is provided; local automated tests use
-  isolated SQLite, so the target deployment should run a PostGIS smoke test.
-- Fiona/GDAL native wheels may need platform-specific installation support for
-  SHP ZIP and GeoPackage uploads.
-- Demonstration map tiles use the public OpenStreetMap raster endpoint; use an
-  approved provider and attribution for deployment.
-- Synthetic data demonstrates pipeline behavior only. It does not establish
-  accuracy, calibration, legal validity, ownership, or official record status.
+Trained GNN, probability calibration, imagery change detection, CAD/scans/point
+clouds/RINEX, ground-control legacy-map transformation, installable offline PWA,
+government/Aadhaar/DigiLocker/NAPIX integrations, blockchain, AR, advanced 3D,
+citizen portal, natural-language spatial queries and Kubernetes are not implemented.
+No legal compliance, government approval or real-world accuracy claim is made.

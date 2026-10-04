@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from pathlib import Path
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from .config import get_settings
@@ -36,4 +37,12 @@ def init_db() -> None:
         # databases where the deploying role is allowed to enable extensions.
         with engine.begin() as connection:
             connection.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-    Base.metadata.create_all(bind=engine)
+    from alembic import command
+    from alembic.config import Config
+    root = Path(__file__).resolve().parents[2]
+    if not (root / "alembic.ini").exists():
+        root = Path(__file__).resolve().parents[1]
+    migration_config = Config(str(root / "alembic.ini"))
+    migration_config.set_main_option("script_location", str(root / "migrations"))
+    migration_config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+    command.upgrade(migration_config, "head")

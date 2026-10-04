@@ -10,3 +10,30 @@
 @media (max-width:1180px) { .metric-grid { grid-template-columns:repeat(2,1fr) }.overview-grid,.bottom-grid { grid-template-columns:1fr }.map-panel { min-height:410px }.review-layout { grid-template-columns:310px minmax(0,1fr) }.review-main { grid-template-columns:1fr }.review-map { min-height:370px }.evidence-card { margin-top:-1px; border-radius:0 0 9px 9px }.validation-banner { grid-template-columns:1fr 1fr 1fr }.validation-banner>div:first-child { grid-column:1/-1 } }
 @media (max-width:820px) { .login-page { grid-template-columns:1fr }.login-art { display:none }.login-panel { min-height:100vh; padding:35px 24px }.login-form>.brand { margin-bottom:50px }.sidebar { top:auto; right:0; z-index:10; width:auto; height:62px; flex-direction:row; border-top:1px solid #345348 }.sidebar-brand,.workspace-switcher,.nav-label,.sidebar-bottom { display:none }.sidebar-nav { display:flex; width:100%; padding:6px 8px }.sidebar-nav button { flex-direction:column; justify-content:center; gap:3px; margin:0; padding:5px; text-align:center }.sidebar-nav button.active:before { display:none }.sidebar-nav button span { font-size:8px }.sidebar-nav button small { position:absolute; top:3px; right:calc(50% - 22px); margin:0; padding:1px 4px }.app-content { margin-left:0; padding-bottom:62px }.app-header { height:62px; padding:0 17px }.breadcrumbs { display:none }.mobile-brand { display:flex; align-items:center; gap:7px; font-family:'Manrope'; font-weight:800; letter-spacing:-.05em }.mobile-brand .brand-symbol { transform:rotate(45deg) scale(.8) }.page-content { padding:27px 17px }.header-action,.header-divider { display:none }.app-footer { margin:0 17px }.welcome-row,.page-title-row { align-items:flex-start; flex-direction:column }.title-actions { width:100% }.title-actions .button { flex:1 }.metric-grid { grid-template-columns:1fr 1fr }.overview-grid,.bottom-grid { grid-template-columns:minmax(0,1fr) }.dataset-foot { gap:10px; flex-direction:column }.review-layout { grid-template-columns:1fr; height:auto; min-height:0; margin:-27px -17px }.review-sidebar { max-height:390px }.review-main { display:block }.review-map { height:380px }.evidence-card { margin:0; border-inline:0 }.snapshot-bar { align-items:flex-start; flex-wrap:wrap }.snapshot-policy { width:100%; margin:0 }.validation-banner { grid-template-columns:1fr }.validation-banner>div:first-child { grid-column:auto }.version-detail,.version-lineage { flex-wrap:wrap }.version-detail .text-button { width:100%; margin:0 }.table-panel,.alerts-panel { border-radius:7px }.app-footer { display:none } }
 @media (max-width:520px) { .metric-grid { grid-template-columns:1fr }.metric-card { display:grid; grid-template-columns:auto 1fr; column-gap:13px }.metric-card-top { grid-row:1/4; margin:0 }.metric-card-top .metric-delta { display:none }.metric-value { font-size:22px }.queue-footer>span { display:none }.review-actions { flex-wrap:wrap }.review-actions .button { flex:1; white-space:nowrap }.review-actions .button-primary { flex-basis:100% }.evidence-head { flex-direction:column }.evidence-score { display:flex; align-items:center; gap:10px }.evidence-metrics { grid-template-columns:repeat(2,1fr) }.evidence-metric:nth-child(2) { border-right:0 }.evidence-metric:nth-child(-n+2) { border-bottom:1px solid #edf1ee }.source-table { overflow:auto }.source-table-head,.source-table-row { min-width:470px }.version-heading { gap:10px }.version-lineage span { flex:1; min-width:42% }.toast { right:12px; bottom:76px; left:12px }.page-title-row h1 { flex-wrap:wrap } }
+.processing-selector { display:grid; grid-template-columns:minmax(220px,1.5fr) minmax(180px,1fr) minmax(180px,1fr); align-items:end; gap:14px; margin-bottom:15px; padding:16px 18px }
+.processing-selector p:last-child { margin-bottom:0; color:var(--muted); font-size:10px; line-height:1.5 }
+.processing-selector label { color:var(--ink-2); font-size:10px; font-weight:700 }
+.processing-selector select { display:block; width:100%; margin-top:6px; border:1px solid var(--line); border-radius:6px; background:white; color:var(--ink); padding:9px; font-size:10px }
+@media (max-width:820px) { .processing-selector { grid-template-columns:1fr } }
+.inspector { padding:20px; margin:16px 0; }
+.inspector h3 { margin:12px 0; }
+.inspector form { padding:14px 0; border-top:1px solid var(--line); }
+.inspector label,.page-content>label { display:block; margin:10px 0; }
+.inspector input:not([type=checkbox]),.inspector select,.inspector textarea,.page-content>label input { display:block; padding:9px; width:100%; max-width:600px; border:1px solid var(--line); border-radius:6px; background:white; color:var(--ink); }
+.mapping-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
+.json-preview { white-space:pre-wrap; overflow-wrap:anywhere; max-height:400px; overflow:auto; background:#f6f8f5; padding:14px; font-size:11px; }
+.hash { overflow-wrap:anywhere; }
+.source-row { display:flex; align-items:center; gap:15px; padding:12px 0; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+.evidence-workspace { display:grid; grid-template-columns:minmax(180px,.5fr) minmax(0,1.5fr); gap:18px; }
+.evidence-list { max-height:700px; overflow:auto; }
+.evidence-list button { display:flex; width:100%; justify-content:space-between; gap:10px; padding:14px; border-bottom:1px solid var(--line); text-align:left; }
+.evidence-list button.selected { background:var(--mint); }
+.map-legend-static { padding:12px; color:var(--muted); }
+.record-preview { max-height:500px; overflow:auto; }
+details { margin:12px 0; } summary { cursor:pointer; padding:6px; }
+.sidebar select { width:185px; margin-top:8px; padding:8px; }
+.sidebar .brand,.login-art .brand { color:#f0f7f2; }
+.mobile-project { display:none; }
+.sidebar-bottom { padding:20px; }.header-actions select { padding:8px; max-width:190px; }
+@media(max-width:820px) { .evidence-workspace { grid-template-columns:1fr; } .header-actions { flex-wrap:wrap; } .evidence-list { max-height:260px; } .app-header { height:auto; min-height:62px; flex-wrap:wrap; gap:10px; } }
+@media(max-width:820px) { .mobile-project { display:block; } }
