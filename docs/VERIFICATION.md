@@ -10,8 +10,9 @@
 | Frontend production build | Passed; MapLibre chunk-size warning remains |
 | Python undefined/unused-name lint (`ruff --select F`) | Passed |
 | `git diff --check` | Checked after documentation updates |
-| Full Docker Compose smoke | Passed; isolated Docker Desktop project, all five services healthy, proxied API workflow and worker job completed |
-| Compose restart and backup/restore | Passed; API restart retained 25 proposals, disposable PostgreSQL and upload-volume round-trips matched |
+| Full Docker Compose smoke | Passed; fresh-volume startup and service checks for PostgreSQL, Redis, API, Celery and Nginx |
+| Chromium against Compose/Nginx | Passed in 13.973 s; uploads, CRS/mapping, Celery matching, review, selection, validation, publication, all five exports, API restart and mobile-width check |
+| Separate-stack database/upload restore | Passed; browser download, publication/lineage, canonical UUID, completed job receipt and both raw uploads matched the source |
 
 The backend suite includes the original-schema migration/restart check, required
 revision handling, namespaces/distant parcels, split-candidate abstention, source
@@ -34,18 +35,52 @@ the version, checks for browser JavaScript errors and checks narrow-screen overf
 - Chromium through Playwright **1.63.0**; Node **22.23.3**, Vite **7.3.6**.
 - Test database and services created under `/tmp/omnirush`; existing application
   databases/storage were not used by these integration runs.
-- Docker Desktop Linux engine **29.8.1** was started through the Windows Docker
+- Docker Desktop Linux engine **29.8.1**, Compose **5.5.1**, was used through the Windows Docker
   CLI because the WSL-native Docker command was not integrated. The isolated
-  Compose project used PostgreSQL **16/PostGIS 3.4**, Redis **7**, API, Celery
-  worker and Nginx frontend. It was named `geosyncai-verify`; its containers and
-  volumes were disposable and were not application data.
-- The smoke path checked `/health` and `/ready`, Nginx `/api` routing, seeded the
-  explicit demo accounts, generated the synthetic pair, submitted a real 25-record
-  match job to Celery, confirmed success, restarted the API, and retrieved all 25
-  persisted proposals. A custom-format PostgreSQL dump restored to a disposable
-  database with migration revision `0003_attribute_sources`; uploaded raw files
-  were copied out and back into a disposable storage restore directory with matching
-  SHA-256 values.
+  Compose runs used PostgreSQL **16.4/PostGIS 3.4.3**, Redis **7.4.11**, Python **3.12**,
+  Celery **5.6.3**, Fiona **1.10.1/GDAL 3.9.2** and Nginx **1.27.5**. The container
+  browser probe used Playwright **1.63.0** and Chromium **153.0.8010.12** from WSL.
+- GitHub [Acceptance run 37339083449](https://github.com/shaurya927/GeoSyncAI/actions/runs/37339083449)
+  passed on commit `6663c0f`. That workflow runs native API/browser tests with
+  PostGIS/Redis service containers; the full Compose probes below ran locally.
+
+### Full Compose browser and restore probes
+
+The initial `geosyncai-verify` smoke checked `/health`, `/ready`, Nginx proxying,
+seeded demo accounts, a real 25-record Celery matching job, API restart and retained
+proposals. Continued verification used independent `geosyncai-browser-verify` and
+`geosyncai-restored-verify` projects, each with its own database/upload volumes.
+
+- Fresh-volume startup exposed a readiness race: the Unix-socket `pg_isready`
+  probe passed during the PostGIS image's temporary initialization server, before
+  the API could connect over TCP. `docker-compose.yml` now probes `127.0.0.1`;
+  startup was repeated successfully with new verification volumes.
+- The browser then exposed HTTP 503 on GeoPackage export: importing Fiona in
+  `python:3.12-slim` failed because `libexpat.so.1` was missing. `backend/Dockerfile`
+  now installs `libexpat1`; API/worker images rebuilt and Fiona import passed.
+- Chromium used the production frontend at port 5173 with its same-origin `/api`
+  proxy. Two unknown-CRS one-parcel GeoJSON uploads were confirmed and mapped,
+  matched by the actual Celery worker, linked by review, explicitly selected,
+  validated and published. All five downloads succeeded. GeoJSON had one stable
+  parcel and two lineage sources; CSV had two rows with the same parcel UUID;
+  quality reported valid; GeoPackage contained one feature with EPSG:32643.
+- Restarting the API retained the publication and identical GeoJSON. The browser
+  reported zero JavaScript errors and no horizontal overflow at 390 px width.
+- Source API/worker containers were stopped before capturing a custom-format
+  `pg_dump` and the upload directory as a tar stream. A separate target stack was
+  started on ports 18000/15173. Its test database was prepared from `template0`,
+  because the stock PostGIS image already initializes extension schemas.
+  `pg_restore --no-owner --single-transaction --exit-on-error` and upload restore
+  completed before the target API/worker started.
+- Through the restored Nginx API and browser, the published GeoJSON/lineage,
+  version/parcel UUIDs, source links, baseline selection and succeeded job receipt
+  matched. Both raw downloads were byte-identical and matched their SHA-256 hashes.
+  Browser login and version download also passed in the restored stack.
+
+Both continued-verification stacks and their volumes/networks were removed after
+the checks. Temporary probe scripts/reports are under `/tmp/omnirush`; existing
+application databases/uploads were not used. The additional Docker fixes and this
+expanded verification record are included in the repository.
 
 ## Synthetic evaluation
 

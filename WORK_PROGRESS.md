@@ -29,8 +29,11 @@ remaining follow-up below describe the implementation being published.
 ## Deployment follow-up
 - [x] Run full Docker Compose build/start/health/backup/restore in an isolated
   Docker Desktop project. Verified PostGIS, Redis, API, Celery, Nginx proxying,
-  a worker match job, API restart persistence, and disposable database/upload
-  backup round-trips on 2026-10-05.
+  fresh-volume startup, a worker match job, Chromium publication/all five exports,
+  API restart persistence, and a coordinated database/upload restore into a
+  separate stack on 2026-10-05. Restored browser/API checks preserved lineage,
+  canonical UUIDs, job receipt and exact raw bytes. Fixed the PostgreSQL TCP
+  readiness race and missing Fiona `libexpat1` runtime dependency.
 - [x] Observe the added GitHub CI workflow on PostgreSQL 16/PostGIS 3.4 and Redis 7.
   Acceptance run passed on the pushed commit.
 

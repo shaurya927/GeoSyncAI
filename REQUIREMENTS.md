@@ -33,7 +33,7 @@ named acceptance path ran; it is not proof of every production edge case.
 | Traceable rollback | Tested | New version, old snapshot retained |
 | Migrations and restart persistence | Tested | Original-schema additive upgrade; browser retrieves publication after API restart |
 | PostgreSQL/PostGIS native geometry/GiST | Tested | Native PostgreSQL 18.6 / PostGIS 3.6.2 integration |
-| Full Compose deployment | Tested | Docker Desktop Compose build/start; PostGIS, Redis, API, Celery and Nginx health; proxied login/matching; API restart persistence; disposable database/upload backup round-trip |
+| Full Compose deployment | Tested | Fresh-volume startup; Chromium/Nginx upload-through-publication; real Celery job; all five exports; API restart; separate-stack database/upload restore verified through browser/API |
 | Secure defaults and opt-in seed | Implemented | Required JWT secret outside demo, explicit seeding, pinned Python/Node dependencies |
 | Synthetic evaluation pack | Generated/measured | ~1,000 parcels, separate answer key, checksums/vertices/dependencies/results in docs |
 | Accuracy/effort objectives | Targets, not generally achieved claims | Scoped synthetic metrics only; schema-suggestion accuracy/manual savings not measured |
@@ -42,6 +42,7 @@ named acceptance path ran; it is not proof of every production edge case.
 
 - **23 backend tests passed** against real PostGIS and Redis/Celery.
 - **1 Chromium E2E passed** against the real PostGIS API, including download and restart.
+- Compose Chromium publication/export/restart and separate-stack restore probes passed.
 - Frontend typecheck/build passed; MapLibre bundle warning remains.
 - Latest synthetic evaluation: **14.0621 seconds**, including simulated review.
 - Detailed commands, environment versions, denominators and limitations:

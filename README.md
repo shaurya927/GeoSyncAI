@@ -91,13 +91,15 @@ The API and worker share the upload volume. Do not start a second local frontend
 on the same port. Docker Desktop's **WSL integration** must be enabled if using it.
 
 **Container verification:** On 2026-10-05, the full Compose target was built and
-started with Docker Desktop using isolated `geosyncai-verify` resources. PostgreSQL
-16/PostGIS 3.4, Redis 7, API, Celery worker and Nginx frontend all became healthy.
-The check exercised the Nginx `/api` proxy, seeded demo data, completed a 25-record
-Celery match job, restarted the API while retaining 25 proposals, and round-tripped
-disposable PostgreSQL and upload-volume backups. The verification used disposable
-volumes and did not use existing application data. The GitHub Acceptance workflow
-also passed on the pushed commit.
+started with Docker Desktop using isolated verification projects. PostgreSQL
+16/PostGIS 3.4, Redis 7, API, Celery worker and Nginx frontend passed service checks.
+Chromium exercised upload → CRS/mapping → worker matching → review → selection →
+validation → publication through Nginx, downloaded all five export formats, and
+retrieved the same publication after API restart. A coordinated database/upload
+backup was restored into a separate stack; its browser download, lineage, UUIDs,
+job receipt and raw upload bytes matched. Fresh-volume startup required a TCP
+PostgreSQL health probe; Fiona in the slim image required `libexpat1`. Both are
+included in the repository. See [verification details](docs/VERIFICATION.md).
 
 ## Officer workflow
 
@@ -180,12 +182,39 @@ mkdir -p backup
 docker compose exec -T postgres pg_dump -U geosyncai -Fc geosyncai > backup/database.dump
 docker compose cp api:/app/storage backup/storage
 docker compose start api worker
+```
 
-# Restore to a new, empty deployment/database, not over existing user data:
-docker compose stop api worker
-docker compose exec -T postgres pg_restore -U geosyncai -d geosyncai < backup/database.dump
+For restore, use a **separate target deployment** and the matching application
+revision. A new PostGIS volume already contains extension schemas, so restore into
+a new database created from `template0`. Keep the target API/worker stopped until
+both the database and uploads are restored:
+
+```bash
+# In the separate target deployment, with its own .env and copies of the backup:
+docker compose up -d postgres redis
+docker compose create api
+docker compose exec -T postgres createdb -U geosyncai -T template0 geosyncai_restored
+docker compose exec -T postgres pg_restore -U geosyncai -d geosyncai_restored \
+  --no-owner --single-transaction --exit-on-error < backup/database.dump
 docker compose cp backup/storage/. api:/app/storage/
-docker compose start api worker
+```
+
+Create `backup/restore.override.yml` in the target deployment to point both
+application services at the restored database:
+
+```yaml
+services:
+  api:
+    environment:
+      DATABASE_URL: postgresql+psycopg://geosyncai:${POSTGRES_PASSWORD}@postgres:5432/geosyncai_restored
+  worker:
+    environment:
+      DATABASE_URL: postgresql+psycopg://geosyncai:${POSTGRES_PASSWORD}@postgres:5432/geosyncai_restored
+```
+
+```bash
+docker compose -f docker-compose.yml -f backup/restore.override.yml up -d
+# Include both -f files for subsequent commands against this restored deployment.
 ```
 
 Reset a local test by choosing a **new database/storage directory**, preserving
