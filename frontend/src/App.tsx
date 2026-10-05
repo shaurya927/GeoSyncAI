@@ -25,23 +25,59 @@ function PolicyEditor({ project, enabled, run }: { project: string; enabled: boo
 function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; selected?: w.Evidence; onSelect: (id: string) => void }) {
   const host = useRef<HTMLDivElement>(null)
   const map = useRef<maplibregl.Map | null>(null)
-  const [ready, setReady] = useState(false)
-  const [basemap, setBasemap] = useState(false)
+  const [readyMap, setReadyMap] = useState<maplibregl.Map | null>(null)
+  const ready = readyMap !== null && readyMap === map.current
+  const [basemap, setBasemap] = useState(true)
+  const [basemapLoaded, setBasemapLoaded] = useState(false)
+  const [basemapError, setBasemapError] = useState('')
+  const [mapError, setMapError] = useState('')
+  const [retry, setRetry] = useState(0)
   const [visible, setVisible] = useState<Record<string, boolean>>({})
+  const basemapEnabled = useRef(basemap)
+  basemapEnabled.current = basemap
   const select = useRef(onSelect)
   select.current = onSelect
   useEffect(() => {
     if (!host.current) return
-    const instance = new maplibregl.Map({ container: host.current, center: [73, 20], zoom: 5,
-      style: { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#e8efe9' } }] } })
-    instance.addControl(new maplibregl.NavigationControl())
-    instance.addControl(new maplibregl.ScaleControl({ unit: 'metric' }))
-    instance.on('load', () => { map.current = instance; setReady(true) })
-    return () => { instance.remove(); map.current = null }
-  }, [])
+    const container = host.current
+    let instance: maplibregl.Map | undefined
+    let observer: ResizeObserver | undefined
+    setReadyMap(null); setMapError(''); setBasemapError(''); setBasemapLoaded(false)
+    try {
+      instance = new maplibregl.Map({ container, center: [73, 20], zoom: 5,
+        style: { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#e8efe9' } }] } })
+      map.current = instance
+      instance.addControl(new maplibregl.NavigationControl())
+      instance.addControl(new maplibregl.ScaleControl({ unit: 'metric' }))
+      // Parcel overlays can initialize as soon as the style is ready, even if
+      // the external basemap is slow or unavailable.
+      instance.on('style.load', () => { if (map.current === instance) setReadyMap(instance || null) })
+      instance.on('sourcedata', event => {
+        if (event.sourceId === 'basemap' && event.tile?.state === 'loaded') setBasemapLoaded(true)
+      })
+      instance.on('error', event => {
+        if (('sourceId' in event && event.sourceId === 'basemap') || event.error.message.includes('basemaps.cartocdn.com')) {
+          if (basemapEnabled.current) setBasemapError('Basemap tiles could not load. Check your connection or turn off the basemap; parcel overlays remain available.')
+        } else setMapError(`Map could not render: ${event.error.message}`)
+      })
+      instance.on('webglcontextlost', () => { setReadyMap(null); setMapError('The browser lost its map graphics context. Retry the map or enable hardware acceleration.') })
+      instance.on('webglcontextrestored', () => { setMapError(''); setReadyMap(instance || null); instance?.resize() })
+      observer = new ResizeObserver(() => instance?.resize())
+      observer.observe(container)
+    } catch {
+      instance?.remove()
+      map.current = null
+      container.replaceChildren()
+      setMapError('Map could not start. Enable WebGL/hardware acceleration in your browser, then retry.')
+    }
+    return () => {
+      observer?.disconnect()
+      if (map.current === instance) { instance?.remove(); map.current = null }
+    }
+  }, [retry])
   useEffect(() => {
-    const instance = map.current
-    if (!instance || !ready) return
+    const instance = readyMap
+    if (!instance || instance !== map.current) return
     const data: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: features.filter(f => f.geometry && visible[f.dataset_id || ''] !== false).map(f => ({
       type: 'Feature', geometry: f.geometry!, properties: { feature_id: f.id, status: f.status,
         comparison: f.id === selected?.left_feature_id ? 'before' : f.id === selected?.right_feature_id ? 'after' : '' } })) }
@@ -66,20 +102,30 @@ function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; se
     }
     focus.forEach(feature => { if ('coordinates' in feature.geometry) extend(feature.geometry.coordinates) })
     if (!bounds.isEmpty()) instance.fitBounds(bounds, { padding: 50, maxZoom: 17, duration: 0 })
-  }, [features, selected, ready, visible])
+  }, [features, selected, readyMap, visible])
   useEffect(() => {
-    const instance = map.current
-    if (!instance || !ready) return
-    if (basemap && !instance.getSource('osm')) {
-      instance.addSource('osm', { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, attribution: '© OpenStreetMap contributors' })
-      instance.addLayer({ id: 'osm', type: 'raster', source: 'osm' }, 'parcel-fill')
+    const instance = readyMap
+    if (!instance || instance !== map.current) return
+    if (basemap && !instance.getSource('basemap')) {
+      instance.addSource('basemap', { type: 'raster', tiles: ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'],
+        tileSize: 256, maxzoom: 20, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · © <a href="https://carto.com/attributions">CARTO</a>' })
+      instance.addLayer({ id: 'basemap', type: 'raster', source: 'basemap' }, instance.getLayer('parcel-fill') ? 'parcel-fill' : undefined)
     }
-    if (instance.getLayer('osm')) instance.setLayoutProperty('osm', 'visibility', basemap ? 'visible' : 'none')
-  }, [basemap, ready])
-  return <section className="panel live-map"><div className="section-head"><strong>{features.filter(f => f.geometry).length} spatial source records</strong>
-    <label><input type="checkbox" checked={basemap} onChange={e => setBasemap(e.target.checked)} /> Optional basemap</label></div>
+    if (instance.getLayer('basemap')) instance.setLayoutProperty('basemap', 'visibility', basemap ? 'visible' : 'none')
+    if (!basemap) setBasemapError('')
+  }, [basemap, readyMap])
+  const spatialCount = features.filter(f => f.geometry).length
+  const visibleCount = features.filter(f => f.geometry && visible[f.dataset_id || ''] !== false).length
+  return <section className="panel live-map" data-map-ready={ready}><div className="section-head"><strong>{spatialCount} spatial source records</strong>
+    <label><input type="checkbox" checked={basemap} onChange={e => setBasemap(e.target.checked)} /> Show basemap</label></div>
     <div className="map-legend-static">{[...new Map(features.map(f => [f.dataset_id || '', f.dataset_name || f.dataset_id])).entries()].map(([id, name]) => <label key={id}><input type="checkbox" checked={visible[id] !== false} onChange={e => setVisible({ ...visible, [id]: e.target.checked })} /> {name} </label>)}</div>
-    <div ref={host} style={{ height: 360 }} /><div className="map-legend-static">Green: normalized source · Amber: baseline/before · Blue: comparison/after</div></section>
+    {(mapError || basemapError) && <div className="map-notice" role={mapError ? 'alert' : 'status'}><span>{mapError || basemapError}</span>
+      <button className="button button-secondary button-small" onClick={() => setRetry(value => value + 1)}>Retry map</button></div>}
+    {!spatialCount && <p className="map-empty">No normalized parcel geometry yet. Upload spatial data and confirm its CRS in Datasets.</p>}
+    {spatialCount > 0 && !visibleCount && <p className="map-empty">All source layers are hidden. Turn on a source layer to display its parcels.</p>}
+    <div ref={host} className="parcel-map-canvas" role="region" aria-label="Parcel map" />
+    {!mapError && <p className="map-status" role="status">{!ready ? 'Loading map…' : !basemap ? 'Basemap off · parcel overlays available' : basemapError ? 'Parcel overlays available' : basemapLoaded ? 'Basemap loaded' : 'Loading basemap…'}</p>}
+    <div className="map-legend-static">Green: normalized source · Amber: baseline/before · Blue: comparison/after</div></section>
 }
 
 function DatasetInspector({ project, dataset, writable, reviewable, refresh, run }: { project: string; dataset: w.Dataset; writable: boolean; reviewable: boolean; refresh: () => Promise<void>; run: (action: () => Promise<void>) => void }) {

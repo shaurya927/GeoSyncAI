@@ -29,6 +29,11 @@
 .evidence-list button { display:flex; width:100%; justify-content:space-between; gap:10px; padding:14px; border-bottom:1px solid var(--line); text-align:left; }
 .evidence-list button.selected { background:var(--mint); }
 .map-legend-static { padding:12px; color:var(--muted); }
+.parcel-map-canvas { height:360px; width:100%; background:#e8efe9; }
+.map-status,.map-empty { margin:0; padding:10px 12px; color:var(--muted); font-size:11px; }
+.map-notice { display:flex; align-items:center; gap:12px; padding:12px; background:var(--amber-bg); color:var(--amber); }
+.map-notice span { flex:1; min-width:0; overflow-wrap:anywhere; }
+.live-map .section-head { flex-wrap:wrap; gap:10px; }
 .record-preview { max-height:500px; overflow:auto; }
 details { margin:12px 0; } summary { cursor:pointer; padding:6px; }
 .sidebar select { width:185px; margin-top:8px; padding:8px; }

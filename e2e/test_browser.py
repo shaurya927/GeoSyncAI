@@ -3,6 +3,7 @@
 Run: python -m pytest e2e -q (install playwright and its Chromium first).
 Only processes created by this test are terminated.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -57,7 +58,19 @@ def test_browser_officer_workflow(tmp_path):
                 page = browser.new_page(viewport={'width': 1440, 'height': 1000}, accept_downloads=True)
                 errors = []
                 page.on('pageerror', lambda error: errors.append(str(error)))
-                page.goto(f'http://127.0.0.1:{web_port}')
+                # Decode actual raster tiles in MapLibre without depending on an
+                # external provider's network availability in CI.
+                tile = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGN48f7lfwAJQwPAmGARvgAAAABJRU5ErkJggg==')
+                tile_requests = []
+                tile_state = {'fail': False}
+                def serve_tile(route):
+                    tile_requests.append(route.request.url)
+                    if tile_state['fail']:
+                        route.abort()
+                    else:
+                        route.fulfill(status=200, content_type='image/png', body=tile)
+                page.route('https://basemaps.cartocdn.com/**', serve_tile)
+                page.goto(f'http://127.0.0.1:{web_port}', wait_until='domcontentloaded')
                 page.get_by_label('Username', exact=True).fill('admin')
                 page.get_by_label('Password', exact=True).fill('admin')
                 page.get_by_role('button', name='Sign in to workspace').click()
@@ -87,7 +100,27 @@ def test_browser_officer_workflow(tmp_path):
                 page.get_by_role('button', name='Generate matches').click()
                 expect(page.get_by_text('Processing completed', exact=True)).to_be_visible(timeout=30000)
                 page.get_by_role('button', name='Review queue', exact=True).click()
-                page.locator('.evidence-list button').first.click()
+                expect(page.get_by_label('Show basemap')).to_be_checked()
+                expect(page.get_by_text('Basemap loaded', exact=True)).to_be_visible()
+                assert tile_requests, 'Basemap must request tiles on first opening'
+                expect(page.locator('.live-map canvas')).to_have_count(1)
+                page.get_by_label('Show basemap').uncheck()
+                expect(page.get_by_text('Basemap off · parcel overlays available', exact=True)).to_be_visible()
+                tile_state['fail'] = True
+                page.get_by_role('button', name='Datasets', exact=True).click()
+                page.get_by_role('button', name='Review queue', exact=True).click()
+                expect(page.get_by_text('Basemap tiles could not load.', exact=False)).to_be_visible()
+                expect(page.locator('.live-map')).to_have_attribute('data-map-ready', 'true')
+                tile_state['fail'] = False
+                page.get_by_role('button', name='Retry map', exact=True).click()
+                expect(page.get_by_text('Basemap loaded', exact=True)).to_be_visible()
+                expect(page.locator('.live-map canvas')).to_have_count(1)
+                # A rendered parcel must still be clickable after tile failure
+                # and map recreation; checking only a canvas misses blank maps.
+                canvas = page.locator('.live-map canvas')
+                bounds = canvas.bounding_box()
+                assert bounds
+                canvas.click(position={'x': bounds['width'] / 2, 'y': bounds['height'] / 2})
                 expect(page.get_by_role('heading', name='Parcel evidence card')).to_be_visible()
                 page.get_by_label('Review rationale').fill('Verified identity only; baseline selected separately')
                 page.get_by_role('button', name='accepted', exact=True).click()

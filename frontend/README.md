@@ -12,8 +12,11 @@ npm run build
 
 `VITE_API_BASE_URL` defaults to `http://localhost:8000/api`. The Compose build uses
 `/api` through Nginx. Synthetic generation is an explicit backend action, not a
-frontend mock mode. No proprietary map token is required; vectors render on a
-local background by default. OpenStreetMap tiles are optional.
+frontend mock mode. No proprietary map token is required. CARTO's light raster
+basemap is enabled by default with OpenStreetMap/CARTO attribution. Turn off
+**Show basemap** for an offline background; parcel overlays remain available when
+tiles fail. Map loading, tile errors and WebGL initialization failures are shown
+with a retry action. Parcel overlays initialize independently of tile downloads.
 
 ## Views
 
@@ -36,4 +39,7 @@ square geometry have been removed.
 The real browser acceptance test is `e2e/test_browser.py`, run from the repository
 root with the Python development dependencies and Playwright Chromium installed.
 It uses actual API uploads, CRS/mapping confirmation, review, publication/download
-and API restart, and checks a narrow-screen layout.
+and API restart, and checks a narrow-screen layout. It also verifies default
+basemap tile loading, the offline toggle, simulated tile failure, retry, and
+clicking a rendered parcel after map recreation. Raster fixtures keep those
+regression checks independent of external tile-provider availability.
