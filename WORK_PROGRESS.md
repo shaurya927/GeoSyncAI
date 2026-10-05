@@ -1,6 +1,6 @@
 # Persistent acceptance / continuation checklist
 
-Last verified: 2026-10-04. The user requested committing and pushing the verified
+Last verified: 2026-10-05. The user requested committing and pushing the verified
 implementation to `shaurya927/GeoSyncAI` on `main`. The acceptance results and
 remaining follow-up below describe the implementation being published.
 
@@ -27,11 +27,12 @@ remaining follow-up below describe the implementation being published.
 - [x] README, architecture, requirement statuses and measured report updated.
 
 ## Deployment follow-up
-- [ ] Run full Docker Compose build/start/health/backup/restore in a Docker-enabled
-  environment. Docker is unavailable in this WSL distro. Native tests do not
-  substitute for a container smoke test.
-- [ ] Observe the added GitHub CI workflow on PostgreSQL 16/PostGIS 3.4 and Redis 7.
-  No remote CI run has been initiated or claimed.
+- [x] Run full Docker Compose build/start/health/backup/restore in an isolated
+  Docker Desktop project. Verified PostGIS, Redis, API, Celery, Nginx proxying,
+  a worker match job, API restart persistence, and disposable database/upload
+  backup round-trips on 2026-10-05.
+- [x] Observe the added GitHub CI workflow on PostgreSQL 16/PostGIS 3.4 and Redis 7.
+  Acceptance run passed on the pushed commit.
 
 ## Remaining prototype limitations (not marked complete)
 - [ ] Approved split/merge editing and canonical membership revision UI. Detection

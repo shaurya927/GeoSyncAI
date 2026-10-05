@@ -1,4 +1,4 @@
-# Verification — 2026-10-04
+# Verification — 2026-10-05
 
 ## Executed
 
@@ -10,6 +10,8 @@
 | Frontend production build | Passed; MapLibre chunk-size warning remains |
 | Python undefined/unused-name lint (`ruff --select F`) | Passed |
 | `git diff --check` | Checked after documentation updates |
+| Full Docker Compose smoke | Passed; isolated Docker Desktop project, all five services healthy, proxied API workflow and worker job completed |
+| Compose restart and backup/restore | Passed; API restart retained 25 proposals, disposable PostgreSQL and upload-volume round-trips matched |
 
 The backend suite includes the original-schema migration/restart check, required
 revision handling, namespaces/distant parcels, split-candidate abstention, source
@@ -32,9 +34,18 @@ the version, checks for browser JavaScript errors and checks narrow-screen overf
 - Chromium through Playwright **1.63.0**; Node **22.23.3**, Vite **7.3.6**.
 - Test database and services created under `/tmp/omnirush`; existing application
   databases/storage were not used by these integration runs.
-- Docker remains unavailable. Compose container builds and its PostgreSQL
-  16/PostGIS 3.4/Redis 7 target have **not** been started here. The added GitHub
-  workflow targets those versions; no remote CI result is claimed.
+- Docker Desktop Linux engine **29.8.1** was started through the Windows Docker
+  CLI because the WSL-native Docker command was not integrated. The isolated
+  Compose project used PostgreSQL **16/PostGIS 3.4**, Redis **7**, API, Celery
+  worker and Nginx frontend. It was named `geosyncai-verify`; its containers and
+  volumes were disposable and were not application data.
+- The smoke path checked `/health` and `/ready`, Nginx `/api` routing, seeded the
+  explicit demo accounts, generated the synthetic pair, submitted a real 25-record
+  match job to Celery, confirmed success, restarted the API, and retrieved all 25
+  persisted proposals. A custom-format PostgreSQL dump restored to a disposable
+  database with migration revision `0003_attribute_sources`; uploaded raw files
+  were copied out and back into a disposable storage restore directory with matching
+  SHA-256 values.
 
 ## Synthetic evaluation
 

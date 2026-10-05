@@ -90,11 +90,14 @@ Nginx proxies `/api` so the browser build does not depend on a hardcoded API hos
 The API and worker share the upload volume. Do not start a second local frontend
 on the same port. Docker Desktop's **WSL integration** must be enabled if using it.
 
-**Verification boundary:** Docker was unavailable in the implementation WSL
-distribution. The complete container build/start has not been run. Native
-PostgreSQL 18.6/PostGIS 3.6.2 and Redis 8.0.5 integration tests passed; Compose
-targets PostgreSQL 16/PostGIS 3.4 and Redis 7. CI is configured to test those target
-database/broker versions, but no remote CI run is claimed.
+**Container verification:** On 2026-10-05, the full Compose target was built and
+started with Docker Desktop using isolated `geosyncai-verify` resources. PostgreSQL
+16/PostGIS 3.4, Redis 7, API, Celery worker and Nginx frontend all became healthy.
+The check exercised the Nginx `/api` proxy, seeded demo data, completed a 25-record
+Celery match job, restarted the API while retaining 25 proposals, and round-tripped
+disposable PostgreSQL and upload-volume backups. The verification used disposable
+volumes and did not use existing application data. The GitHub Acceptance workflow
+also passed on the pushed commit.
 
 ## Officer workflow
 
