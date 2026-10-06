@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 250 * 1024 * 1024
     max_zip_members: int = 10000
     max_zip_uncompressed_bytes: int = 1024 * 1024 * 1024
+    job_lease_seconds: int = 60
+    job_heartbeat_seconds: int = 10
+    job_max_attempts: int = 3
+    field_max_assignments: int = 500
+    field_max_photo_bytes: int = 5 * 1024 * 1024
+    field_max_queued_bytes: int = 10 * 1024 * 1024
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

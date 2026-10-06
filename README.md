@@ -103,6 +103,14 @@ job receipt and raw upload bytes matched. Fresh-volume startup required a TCP
 PostgreSQL health probe; Fiona in the slim image required `libexpat1`. Both are
 included in the repository. See [verification details](docs/VERIFICATION.md).
 
+**Defect-fix verification:** On 2026-10-06, a fresh disposable Compose project
+was rebuilt through migration `0006_integrity_access_leases`; PostGIS, Redis,
+the API, Celery worker and Nginx frontend reached healthy/ready states. The
+Postgres-container regression run passed 32 tests with one existing skip and
+one migration subprocess test deselected because its copied test path cannot
+see the repository-level migration package. The full current verification log
+records the system-Python Fiona limitation and remaining browser/restore work.
+
 ## Officer workflow
 
 1. Create/select a project. Upload GeoJSON, CSV (including attribute-only tables),

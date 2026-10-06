@@ -12,11 +12,12 @@ from typing import Annotated
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from .auth import CurrentUser, ensure_project_access, hash_password, verify_password, create_access_token
+from .auth import (CurrentUser, ensure_project_access, ensure_project_membership, hash_password, verify_password,
+                   create_access_token, project_member, utc_expired)
 from .config import get_settings
 from .db import get_db, init_db
 from .models import (Dataset, Job, MatchProposal, Project, ProjectMember, ReviewDecision, SourceFeature,
@@ -28,16 +29,16 @@ from .schemas import (CRSConfirmation, ChangeRequest, DatasetRegister, LoginRequ
                        ProjectCreate, ProjectOut, ReviewRequest, SchemaMappingRequest, SelectionRequest, PolicyRequest, Token,
                        DatasetMetadataRequest, MappingDictionaryRequest, DepartmentTemplateRequest, ReconciliationRequest,
                        ReconciliationDecision, GeometryChangeSetRequest, GeometryDecision, MeasurementRequest,
-                       GroundControlRequest, TrainingExampleRequest, RankerTrainRequest, AssignmentRequest,
-                       FieldEvidenceRequest, QueryRequest, ComplianceRuleRequest, ComplianceEvaluateRequest,
+                       GroundControlRequest, GroundControlApprovalRequest, TrainingExampleRequest, RankerTrainRequest, AssignmentRequest,
+                       FieldEvidenceRequest, FieldEvidenceResolutionRequest, QueryRequest, ComplianceRuleRequest, ComplianceEvaluateRequest,
                        CitizenGrantRequest, CitizenCaseRequest)
 from .services import (audit, bootstrap_synthetic, confirm_dataset_crs, ingest_dataset, materialize_identity_link,
                        run_change_detection, run_matching, run_topology, administrative_context, touch_project, next_version,
                        invalidate_dataset_evidence)
-from .publication import publish, validate_project
+from .publication import canonical_sha256, publish, validate_project
 from .policy import processing_policy
 from .tasks import dispatch_job, recover_jobs, configuration_hash as job_configuration_hash
-from .advanced import (build_reconciliation, compliance_result, geometry_measurements,
+from .advanced import (build_reconciliation, compliance_result, geometry_measurements, validate_compliance_rule,
                        fit_control_points, measure_geometry, parse_structured_query, train_ranker)
 
 
@@ -124,6 +125,21 @@ def me(user: CurrentUser):
     return {"id": user.id, "username": user.username, "role": user.role}
 
 
+@app.get("/api/projects/{project_id}/capabilities")
+def capabilities(project_id: str, db: Db, user: CurrentUser):
+    project = ensure_project_membership(db, project_id, user)
+    member = project_member(db, project_id, user.id)
+    role = user.role
+    departmental = role in {"admin", "processor", "reviewer", "steward", "viewer"}
+    return {"project_id": project.id, "role": role, "project_role": member.project_role if member else "admin",
+            "read_project": True, "read_departmental": departmental,
+            "process": role in {"admin", "processor", "reviewer", "steward"},
+            "review": role in {"admin", "reviewer", "steward"},
+            "publish": role in {"admin", "reviewer", "steward"},
+            "fieldwork": role in {"admin", "field", "processor", "reviewer", "steward"},
+            "citizen_records": role == "citizen", "exports": departmental}
+
+
 @app.get("/api/projects", response_model=list[ProjectOut])
 def list_projects(db: Db, user: CurrentUser):
     if user.role == "admin":
@@ -134,7 +150,7 @@ def list_projects(db: Db, user: CurrentUser):
 
 @app.post("/api/projects", response_model=ProjectOut)
 def create_project(payload: ProjectCreate, db: Db, user: CurrentUser):
-    if user.role == "viewer":
+    if user.role not in {"admin", "processor", "reviewer", "steward"}:
         raise HTTPException(status_code=403, detail="Write access denied")
     project = Project(name=payload.name, description=payload.description, owner_id=user.id)
     db.add(project)
@@ -147,7 +163,7 @@ def create_project(payload: ProjectCreate, db: Db, user: CurrentUser):
 
 @app.get("/api/projects/{project_id}", response_model=ProjectOut)
 def get_project(project_id: str, db: Db, user: CurrentUser):
-    return ensure_project_access(db, project_id, user)
+    return ensure_project_membership(db, project_id, user)
 
 
 @app.get("/api/projects/{project_id}/policy")
@@ -475,8 +491,24 @@ def get_schema_mapping(project_id: str, dataset_id: str, db: Db, user: CurrentUs
                    "property_account": ["property_id", "account_no"], "village": ["village", "village_name"],
                    "village_code": ["village_code", "admin_code"], "recorded_area": ["area", "recorded_area", "area_m2", "area_sq_m", "recorded_area_m2"]}
         suggested = {key: field for key, names in aliases.items() for field in fields if field.casefold() in names}
+        dictionary = list(db.scalars(select(MappingDictionaryEntry).where(
+            MappingDictionaryEntry.project_id == project_id, MappingDictionaryEntry.status == "confirmed")
+            .order_by(MappingDictionaryEntry.version.desc())))
+        for entry in dictionary:
+            for field in fields:
+                if field.casefold() in {entry.source_term.casefold(), entry.normalized_term.casefold()}:
+                    suggested.setdefault(entry.canonical_field, field)
+        templates = list(db.scalars(select(DepartmentTemplate).where(
+            DepartmentTemplate.project_id == project_id, DepartmentTemplate.status == "confirmed")
+            .order_by(DepartmentTemplate.version.desc())))
+        for template in templates:
+            for canonical, source_field in (template.mapping or {}).items():
+                if isinstance(source_field, str) and source_field in fields:
+                    suggested.setdefault(canonical, source_field)
         return {"version": 0, "status": "draft", "mapping": suggested,
-                "source_fields": (dataset.validation_report or {}).get('schema_summary', [{"name": field} for field in fields])}
+                "source_fields": (dataset.validation_report or {}).get('schema_summary', [{"name": field} for field in fields]),
+                "suggestion_evidence": {"dictionary_entry_ids": [entry.id for entry in dictionary],
+                                        "department_template_ids": [template.id for template in templates]}}
     return {"id": mapping.id, "version": mapping.version, "status": mapping.status,
             "mapping": mapping.mapping, "source_fields": mapping.source_fields,
             "created_at": mapping.created_at}
@@ -531,27 +563,36 @@ def list_features(project_id: str, dataset_id: str, db: Db, user: CurrentUser, l
     dataset = db.get(Dataset, dataset_id)
     if not dataset or dataset.project_id != project_id:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    if dataset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+        raise HTTPException(403, "Restricted source features require steward or reviewer permission")
     limit = max(1, min(limit, 1000)); offset = max(0, offset)
-    features = list(db.scalars(select(SourceFeature).where(SourceFeature.dataset_id == dataset_id)
-                               .order_by(SourceFeature.id)))
     bounds = None
     if bbox:
         try:
             values = [float(value) for value in bbox.split(",")]
-            if len(values) != 4: raise ValueError
+            if len(values) != 4 or values[0] > values[2] or values[1] > values[3]: raise ValueError
             bounds = values
         except ValueError as exc:
             raise HTTPException(422, "bbox must contain four numeric CRS84 coordinates") from exc
-    if bounds:
+    feature_query = select(SourceFeature).where(SourceFeature.dataset_id == dataset_id).order_by(SourceFeature.id)
+    database_bbox = bool(bounds and hasattr(SourceFeature, "spatial_geometry"))
+    if database_bbox:
+        feature_query = feature_query.where(
+            func.ST_Intersects(SourceFeature.spatial_geometry, func.ST_MakeEnvelope(*bounds, 4326))
+        )
+    features = list(db.scalars(feature_query.offset(offset).limit(limit) if (not bounds or database_bbox)
+                              else feature_query))
+    if bounds and not database_bbox:
         from shapely.geometry import shape
         features = [feature for feature in features if feature.normalized_geometry and not (
             shape(feature.normalized_geometry).bounds[2] < bounds[0] or shape(feature.normalized_geometry).bounds[0] > bounds[2] or
             shape(feature.normalized_geometry).bounds[3] < bounds[1] or shape(feature.normalized_geometry).bounds[1] > bounds[3])]
+    page = features if database_bbox or not bounds else features[offset:offset + limit]
     return [{"id": f.id, "original_id": f.original_id, "attributes": f.raw_attributes,
              "original_geometry": f.original_geometry, "geometry": f.normalized_geometry,
              "administrative_context": f.administrative_context, "canonical_attributes": f.canonical_attributes, "status": f.status,
              "processing_reason": f.processing_reason}
-             for f in features[offset:offset + limit]]
+              for f in page]
 
 
 @app.get("/api/projects/{project_id}/datasets/{dataset_id}/raw")
@@ -652,19 +693,51 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
                                                           ParcelEntity.status == "active")))
     if len(entities) != len(set(payload.parcel_entity_ids)):
         raise HTTPException(404, "Every parcel in a geometry changeset must belong to this project")
-    if payload.operation in {"split", "merge", "shared_edge"} and len(payload.parcel_entity_ids) < 2:
+    if payload.operation == "split" and len(payload.parcel_entity_ids) != 1:
+        raise HTTPException(422, "A split has exactly one approved parent parcel")
+    if payload.operation in {"merge", "shared_edge"} and len(payload.parcel_entity_ids) < 2:
         raise HTTPException(422, "This operation requires at least two affected parcel identities")
+    if payload.operation in {"move", "shared_edge"} and set(payload.draft_geometries) != set(payload.parcel_entity_ids):
+        raise HTTPException(422, "Draft geometry keys must exactly match affected parcel identities")
+    if payload.operation == "split" and len(payload.draft_geometries) < 2:
+        raise HTTPException(422, "A split requires at least two proposed child geometries")
+    if payload.operation == "merge" and len(payload.draft_geometries) != 1:
+        raise HTTPException(422, "A merge requires exactly one proposed successor geometry")
+    if payload.operation in {"split", "merge"} and not payload.attribute_source_id:
+        raise HTTPException(422, "Split/merge requires an explicit reviewed attribute source")
+    if payload.attribute_source_id:
+        predecessor_members = set(db.scalars(select(ParcelSourceLink.source_feature_id).where(
+            ParcelSourceLink.parcel_entity_id.in_(payload.parcel_entity_ids))))
+        if payload.attribute_source_id not in predecessor_members:
+            raise HTTPException(422, "Attribute source must be linked to an affected predecessor parcel")
     try:
         measurements = geometry_measurements(db, payload.parcel_entity_ids, payload.draft_geometries)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if payload.operation == "split" and measurements["area_conservation_delta_m2"] > 0.01:
-        raise HTTPException(422, "Split draft does not conserve source area within 0.01 m²")
-    change = GeometryChangeSet(project_id=project_id, operation=payload.operation,
+    if payload.operation in {"split", "merge"} and abs(measurements["area_conservation_delta_m2"]) > 0.01:
+        raise HTTPException(422, f"{payload.operation.title()} draft does not conserve source area within 0.01 m²")
+    change_id = uid()
+    draft_geometries = dict(payload.draft_geometries)
+    successor_ids = list(payload.successor_ids)
+    if payload.operation in {"split", "merge"}:
+        successor_ids = [uid() for _ in draft_geometries]
+        draft_geometries = {successor_id: geometry for successor_id, geometry in zip(successor_ids, draft_geometries.values())}
+        for successor_id in successor_ids:
+            db.add(ParcelEntity(id=successor_id, project_id=project_id,
+                                canonical_key=f"{payload.operation}:{change_id}:{successor_ids.index(successor_id)}", status="draft"))
+        db.flush()
+        for successor_id in successor_ids:
+            db.add(ParcelSourceLink(project_id=project_id, parcel_entity_id=successor_id,
+                                    source_feature_id=payload.attribute_source_id, link_status="derived_evidence"))
+            db.add(ParcelSelection(parcel_entity_id=successor_id, geometry_source_id=None,
+                                   attribute_source_id=payload.attribute_source_id,
+                                   attribute_sources=payload.attribute_sources, actor_id=user.id,
+                                   rationale=f"Derived successor baseline for reviewed {payload.operation}", revision=1))
+    change = GeometryChangeSet(id=change_id, project_id=project_id, operation=payload.operation,
                                parcel_entity_ids=payload.parcel_entity_ids,
                                predecessor_ids=payload.parcel_entity_ids if payload.operation in {"split", "merge"} else [],
-                               successor_ids=payload.successor_ids, before_geometries=measurements.get("before_geometries", {}),
-                               draft_geometries=payload.draft_geometries,
+                               successor_ids=successor_ids, before_geometries=measurements.get("before_geometries", {}),
+                               draft_geometries=draft_geometries,
                                measurements=measurements, authorization=payload.authorization,
                                rationale=payload.rationale, created_by=user.id)
     db.add(change)
@@ -692,9 +765,20 @@ def decide_geometry_changeset(project_id: str, change_id: str, payload: Geometry
         raise HTTPException(409, "Geometry changeset is stale or final")
     change.status = payload.decision
     change.rationale = f"{change.rationale}\nDecision: {payload.rationale}"
+    change.decision_rationale = payload.rationale
+    change.decision_at = datetime.now(timezone.utc)
     change.revision += 1
     if payload.decision == "approved":
         change.approved_geometries = change.draft_geometries
+        change.approved_by = user.id
+        for predecessor_id in change.predecessor_ids:
+            predecessor = db.get(ParcelEntity, predecessor_id)
+            if predecessor:
+                predecessor.status = "superseded"
+        for successor_id in change.successor_ids:
+            successor = db.get(ParcelEntity, successor_id)
+            if successor:
+                successor.status = "active"
         # Publication still requires an explicit validated baseline/change. The
         # approved artifact is recorded here and never mutates original uploads.
         audit(db, "geometry_changeset_approved", user.id, project_id, "geometry_changeset", change.id,
@@ -713,15 +797,17 @@ def geometry_changeset_response(change: GeometryChangeSet) -> dict:
             "parcel_entity_ids": change.parcel_entity_ids, "predecessor_ids": change.predecessor_ids,
             "successor_ids": change.successor_ids, "before_geometries": change.before_geometries,
             "draft_geometries": change.draft_geometries, "approved_geometries": change.approved_geometries,
-            "measurements": change.measurements, "authorization": change.authorization, "rationale": change.rationale}
+            "measurements": change.measurements, "authorization": change.authorization, "rationale": change.rationale,
+            "approved_by": change.approved_by, "decision_at": change.decision_at,
+            "decision_rationale": change.decision_rationale}
 
 
 @app.post("/api/projects/{project_id}/measurements")
 def measure(project_id: str, payload: MeasurementRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     try:
-        return measure_geometry(payload.geometry, payload.source_crs, payload.analysis_crs, payload.purpose)
-    except (ValueError, TypeError) as exc:
+        return measure_geometry(payload.geometry, payload.source_crs, payload.analysis_crs, payload.purpose, payload.method)
+    except Exception as exc:
         raise HTTPException(422, str(exc)) from exc
 
 
@@ -729,19 +815,31 @@ def measure(project_id: str, payload: MeasurementRequest, db: Db, user: CurrentU
 def create_ground_control(project_id: str, payload: GroundControlRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
     validate_dataset(db, project_id, payload.dataset_id)
-    if len(payload.control_points) < {"translation": 1, "similarity": 2, "affine": 3}[payload.method]:
-        raise HTTPException(422, "Insufficient paired control points for the selected fitting method")
     # Coordinates are supplied as {source:[x,y], target:[x,y]}; residuals are
     # explicit and independent checkpoints can be tagged in the point payload.
     for point in payload.control_points:
         source = point.get("source"); target = point.get("target")
         if not isinstance(source, list) or not isinstance(target, list) or len(source) < 2 or len(target) < 2:
             raise HTTPException(422, "Each control point needs source and target coordinate pairs")
+    fitting_points = [point for point in payload.control_points if not point.get("checkpoint")]
+    checkpoint_points = [point for point in payload.control_points if point.get("checkpoint")]
     try:
-        fit = fit_control_points(payload.method, payload.control_points)
+        fit = fit_control_points(payload.method, fitting_points, checkpoint_points)
     except (ValueError, TypeError, FloatingPointError) as exc:
         raise HTTPException(422, str(exc)) from exc
+    dataset = validate_dataset(db, project_id, payload.dataset_id)
+    source_crs = payload.source_crs or dataset.declared_crs
+    target_crs = payload.target_crs or source_crs
+    if not source_crs or not target_crs:
+        raise HTTPException(422, "Source and target CRS are required for a ground-control session")
+    try:
+        from pyproj import CRS
+        CRS.from_user_input(source_crs); CRS.from_user_input(target_crs)
+    except Exception as exc:
+        raise HTTPException(422, "Invalid ground-control source or target CRS") from exc
+    fit["max_checkpoint_residual_threshold"] = payload.max_checkpoint_residual
     session = GroundControlSession(project_id=project_id, dataset_id=payload.dataset_id, method=payload.method,
+                                   source_crs=source_crs, target_crs=target_crs,
                                    control_points=payload.control_points,
                                    residuals={"count": len(payload.control_points), **fit}, created_by=user.id)
     db.add(session)
@@ -753,21 +851,99 @@ def create_ground_control(project_id: str, payload: GroundControlRequest, db: Db
 
 
 @app.post("/api/projects/{project_id}/ground-control/{session_id}/approve")
-def approve_ground_control(project_id: str, session_id: str, db: Db, user: CurrentUser):
+def approve_ground_control(project_id: str, session_id: str, db: Db, user: CurrentUser,
+                           payload: GroundControlApprovalRequest | None = None):
     ensure_project_access(db, project_id, user, write=True, review=True)
     session = db.get(GroundControlSession, session_id)
     if not session or session.project_id != project_id:
         raise HTTPException(404, "Ground control session not found")
-    if not session.residuals.get("independent_checkpoints"):
+    if payload is None:
+        payload = GroundControlApprovalRequest(expected_revision=session.revision, rationale="Legacy approval request")
+    if session.revision != payload.expected_revision:
+        raise HTTPException(409, "Ground-control session changed; refresh before approval")
+    if not session.residuals.get("checkpoint_count"):
         raise HTTPException(409, "An independent checkpoint is required before approval")
-    session.status = "approved"; session.approved_by = user.id; session.revision += 1
+    if session.residuals.get("checkpoint_max") is None or session.residuals["checkpoint_max"] > session.residuals.get("max_checkpoint_residual_threshold", 1.0):
+        raise HTTPException(409, "Independent checkpoint residual exceeds the configured threshold")
+    source_dataset = validate_dataset(db, project_id, session.dataset_id)
+    try:
+        aligned_dataset = apply_ground_control_version(db, source_dataset, session, user.id, payload.rationale)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    session.status = "approved"; session.approved_by = user.id; session.approved_dataset_id = aligned_dataset.id; session.revision += 1
     audit(db, "ground_control_approved", user.id, project_id, "ground_control", session.id, session.residuals)
     db.commit()
     return ground_control_response(session)
 
 
+def apply_ground_control_version(db: Session, source_dataset: Dataset, session: GroundControlSession,
+                                 actor_id: str, rationale: str) -> Dataset:
+    from shapely.affinity import affine_transform
+    from shapely.geometry import mapping, shape
+    from .services import analysis_crs_for, spatial_column
+    from .spatial import reproject
+    parameters = session.residuals.get("parameters") or {}
+    if session.method == "translation":
+        tx, ty = parameters.get("translation", [0, 0])
+        affine_parameters = [1, 0, 0, 1, tx, ty]
+    elif session.method == "similarity":
+        affine_parameters = [parameters["a"], -parameters["b"], parameters["b"], parameters["a"], parameters["tx"], parameters["ty"]]
+    elif session.method == "affine":
+        x, y = parameters.get("x", []), parameters.get("y", [])
+        if len(x) != 3 or len(y) != 3:
+            raise ValueError("Stored affine parameters are incomplete")
+        affine_parameters = [x[0], x[1], y[0], y[1], x[2], y[2]]
+    else:
+        raise ValueError("Unsupported ground-control method")
+    aligned = Dataset(id=uid(), project_id=source_dataset.project_id, name=f"{source_dataset.name} · aligned",
+                      source_organization=source_dataset.source_organization, capture_date=source_dataset.capture_date,
+                      content_hash=source_dataset.content_hash, original_filename=source_dataset.original_filename,
+                      mime_type=source_dataset.mime_type, raw_path=source_dataset.raw_path,
+                      declared_crs=session.target_crs, access_classification=source_dataset.access_classification,
+                      accuracy_metadata=source_dataset.accuracy_metadata, metadata_json=source_dataset.metadata_json,
+                      administrative_namespace=source_dataset.administrative_namespace,
+                      license_classification=source_dataset.license_classification, provenance=source_dataset.provenance,
+                      source_version=source_dataset.source_version, version_label=f"aligned-from-{source_dataset.id}",
+                      status="processed")
+    db.add(aligned); db.flush()
+    output_count = 0
+    for source in db.scalars(select(SourceFeature).where(SourceFeature.dataset_id == source_dataset.id)):
+        normalized_geometry = None
+        geometry_type = source.geometry_type
+        if source.original_geometry:
+            try:
+                transformed = affine_transform(shape(source.original_geometry), affine_parameters)
+                normalized = transformed if session.target_crs == "EPSG:4326" else reproject(transformed, session.target_crs, "EPSG:4326")
+                if not normalized.is_valid:
+                    raise ValueError(f"Aligned geometry {source.id} is invalid")
+                normalized_geometry = mapping(normalized)
+                geometry_type = normalized.geom_type
+                output_count += 1
+            except Exception as exc:
+                raise ValueError(f"Could not apply alignment to source feature {source.id}: {exc}") from exc
+        db.add(SourceFeature(dataset_id=aligned.id, original_id=source.original_id,
+                              raw_attributes=source.raw_attributes, original_geometry=source.original_geometry,
+                              normalized_geometry=normalized_geometry, administrative_context=source.administrative_context,
+                              canonical_attributes=source.canonical_attributes, geometry_type=geometry_type,
+                              status="processed" if normalized_geometry or not source.original_geometry else "quarantined",
+                              processing_reason=None if normalized_geometry or not source.original_geometry else "Alignment produced no valid geometry",
+                              **spatial_column(shape(normalized_geometry) if normalized_geometry else None, "EPSG:4326")))
+    aligned.normalized_crs = "EPSG:4326" if output_count else None
+    aligned.normalized_count = output_count
+    aligned.geometry_type = source_dataset.geometry_type
+    first_geometry = next((feature.normalized_geometry for feature in db.scalars(select(SourceFeature).where(SourceFeature.dataset_id == aligned.id)) if feature.normalized_geometry), None)
+    aligned.analysis_crs = analysis_crs_for(shape(first_geometry)) if first_geometry else None
+    aligned.crs_transform = {"method": "ground_control", "source_crs": session.source_crs, "target_crs": session.target_crs,
+                             "parameters": parameters, "residuals": session.residuals, "approved_by": actor_id,
+                             "rationale": rationale}
+    aligned.crs_confirmed_by = actor_id
+    aligned.crs_confirmed_at = datetime.now(timezone.utc)
+    return aligned
+
+
 def ground_control_response(session: GroundControlSession) -> dict:
     return {"id": session.id, "dataset_id": session.dataset_id, "method": session.method,
+            "source_crs": session.source_crs, "target_crs": session.target_crs, "approved_dataset_id": session.approved_dataset_id,
             "control_points": session.control_points, "residuals": session.residuals,
             "status": session.status, "revision": session.revision}
 
@@ -828,6 +1004,12 @@ def create_field_assignment(project_id: str, payload: AssignmentRequest, db: Db,
     assignee = db.get(User, payload.assignee_id)
     if not assignee or assignee.role not in {"field", "processor", "reviewer", "admin"}:
         raise HTTPException(422, "Assignments require an authorized fieldwork account")
+    if not project_member(db, project_id, assignee.id) and assignee.role != "admin":
+        raise HTTPException(422, "The assignee must be an active member of this project")
+    if utc_expired(payload.expires_at):
+        raise HTTPException(422, "Assignment expiry must be in the future")
+    if len(payload.parcel_entity_ids) > get_settings().field_max_assignments:
+        raise HTTPException(422, "Assignment exceeds the configured parcel bound")
     entities = list(db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id,
                                                           ParcelEntity.id.in_(payload.parcel_entity_ids),
                                                           ParcelEntity.status == "active")))
@@ -845,24 +1027,66 @@ def create_field_assignment(project_id: str, payload: AssignmentRequest, db: Db,
 
 @app.get("/api/projects/{project_id}/field-assignments")
 def list_field_assignments(project_id: str, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="fieldwork")
     query = select(FieldAssignment).where(FieldAssignment.project_id == project_id)
     if user.role == "field":
         query = query.where(FieldAssignment.assignee_id == user.id)
-    return [assignment_response(assignment) for assignment in db.scalars(query.order_by(FieldAssignment.created_at.desc()))]
+    assignments = list(db.scalars(query.order_by(FieldAssignment.created_at.desc())))
+    if user.role == "field":
+        assignments = [assignment for assignment in assignments
+                       if assignment.status in {"assigned", "active"} and not utc_expired(assignment.expires_at)]
+    return [assignment_response(assignment) for assignment in assignments]
+
+
+@app.get("/api/projects/{project_id}/field-assignments/{assignment_id}/reference")
+def field_assignment_reference(project_id: str, assignment_id: str, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, capability="fieldwork")
+    assignment = db.get(FieldAssignment, assignment_id)
+    if not assignment or assignment.project_id != project_id or assignment.assignee_id != user.id:
+        raise HTTPException(404, "Assignment not found")
+    if assignment.status not in {"assigned", "active"} or utc_expired(assignment.expires_at):
+        raise HTTPException(403, "Assignment is expired or revoked")
+    allowed = set((assignment.reference_policy or {}).get("fields", []))
+    if not allowed:
+        allowed = {"parcel_id", "survey_number", "village", "village_code", "district", "ward", "recorded_area", "area_units"}
+    output = []
+    for parcel_id in assignment.parcel_entity_ids:
+        entity = db.get(ParcelEntity, parcel_id)
+        if not entity or entity.project_id != project_id or entity.status != "active":
+            continue
+        selection = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == entity.id))
+        if not selection:
+            continue
+        attribute = db.get(SourceFeature, selection.attribute_source_id)
+        geometry = db.get(SourceFeature, selection.geometry_source_id) if selection.geometry_source_id else None
+        if not attribute:
+            continue
+        values = attribute.canonical_attributes or attribute.raw_attributes
+        output.append({"parcel_entity_id": entity.id, "attributes": {key: values.get(key) for key in allowed},
+                       "geometry": geometry.normalized_geometry if geometry else None})
+    return {"assignment_id": assignment.id, "expires_at": assignment.expires_at, "features": output}
 
 
 @app.post("/api/projects/{project_id}/field-assignments/{assignment_id}/evidence", status_code=201)
 def submit_field_evidence(project_id: str, assignment_id: str, payload: FieldEvidenceRequest, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="fieldwork")
     assignment = db.get(FieldAssignment, assignment_id)
     if not assignment or assignment.project_id != project_id or (user.role == "field" and assignment.assignee_id != user.id):
         raise HTTPException(404, "Assignment not found")
+    if assignment.assignee_id != user.id and user.role not in {"admin", "reviewer", "steward"}:
+        raise HTTPException(403, "Only the assigned officer can submit field evidence")
+    if assignment.status not in {"assigned", "active"} or utc_expired(assignment.expires_at):
+        raise HTTPException(403, "Assignment is expired or revoked")
     if payload.parcel_entity_id not in (assignment.parcel_entity_ids or []):
         raise HTTPException(422, "Evidence parcel is outside the bounded assignment")
     existing = db.scalar(select(FieldEvidence).where(FieldEvidence.client_event_id == payload.client_event_id))
     if existing:
+        if (existing.created_by != user.id or existing.assignment_id != assignment_id or
+                existing.parcel_entity_id != payload.parcel_entity_id or existing.payload != payload.payload):
+            raise HTTPException(409, "Client event ID is already used by a different evidence payload")
         return field_evidence_response(existing)
+    if len(json.dumps(payload.payload, default=str).encode()) > get_settings().field_max_queued_bytes:
+        raise HTTPException(413, "Evidence payload exceeds the configured bound")
     project = db.get(Project, project_id)
     status = "submitted" if project and payload.expected_project_revision == project.workflow_revision else "revision_conflict"
     evidence = FieldEvidence(assignment_id=assignment_id, parcel_entity_id=payload.parcel_entity_id,
@@ -873,6 +1097,43 @@ def submit_field_evidence(project_id: str, assignment_id: str, payload: FieldEvi
           {"client_event_id": payload.client_event_id, "status": status})
     db.commit()
     return field_evidence_response(evidence)
+
+
+@app.post("/api/projects/{project_id}/field-assignments/{assignment_id}/evidence/{evidence_id}/resolve")
+def resolve_field_evidence(project_id: str, assignment_id: str, evidence_id: str,
+                           payload: FieldEvidenceResolutionRequest, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, capability="fieldwork")
+    assignment = db.get(FieldAssignment, assignment_id)
+    evidence = db.get(FieldEvidence, evidence_id)
+    if not assignment or assignment.project_id != project_id or not evidence or evidence.assignment_id != assignment_id:
+        raise HTTPException(404, "Field evidence not found")
+    if evidence.status not in {"revision_conflict", "submitted"} or evidence.expected_project_revision != payload.expected_revision:
+        raise HTTPException(409, "Evidence revision is stale or already final")
+    if payload.decision in {"accept", "reject"}:
+        if user.role not in {"admin", "reviewer", "steward"}:
+            raise HTTPException(403, "Reviewer permission is required to resolve evidence")
+        evidence.status = "accepted" if payload.decision == "accept" else "rejected"
+        audit(db, "field_evidence_resolved", user.id, project_id, "field_evidence", evidence.id,
+              {"decision": payload.decision, "rationale": payload.rationale})
+        db.commit()
+        return field_evidence_response(evidence)
+    if assignment.assignee_id != user.id:
+        raise HTTPException(403, "Only the assigned officer can resubmit a draft")
+    if assignment.status not in {"assigned", "active"} or utc_expired(assignment.expires_at):
+        raise HTTPException(403, "Assignment is expired or revoked")
+    if payload.new_expected_project_revision is None:
+        raise HTTPException(422, "A current project revision is required for resubmission")
+    project = db.get(Project, project_id)
+    next_evidence = FieldEvidence(assignment_id=assignment_id, parcel_entity_id=evidence.parcel_entity_id,
+                                  client_event_id=f"{evidence.client_event_id}:resubmit:{uid()}", payload=evidence.payload,
+                                  status="submitted" if project and payload.new_expected_project_revision == project.workflow_revision else "revision_conflict",
+                                  expected_project_revision=payload.new_expected_project_revision, created_by=user.id)
+    evidence.status = "superseded"
+    db.add(next_evidence)
+    audit(db, "field_evidence_resubmitted", user.id, project_id, "field_evidence", next_evidence.id,
+          {"supersedes": evidence.id, "rationale": payload.rationale})
+    db.commit()
+    return field_evidence_response(next_evidence)
 
 
 def assignment_response(assignment: FieldAssignment) -> dict:
@@ -939,9 +1200,22 @@ def structured_query(project_id: str, payload: QueryRequest, db: Db, user: Curre
 @app.post("/api/projects/{project_id}/compliance-rules", status_code=201)
 def create_compliance_rule(project_id: str, payload: ComplianceRuleRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True, review=payload.confirm)
+    formula = {**payload.formula}
+    if payload.operator:
+        formula["operator"] = payload.operator
+    threshold = {**payload.threshold}
+    if payload.units:
+        threshold["units"] = payload.units
+    try:
+        validate_compliance_rule({"formula": formula, "threshold": threshold, "operator": payload.operator})
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    version = (db.scalar(select(ComplianceRule.version).where(ComplianceRule.project_id == project_id,
+                                                             ComplianceRule.name == payload.name)
+                         .order_by(ComplianceRule.version.desc())) or 0) + 1
     rule = ComplianceRule(project_id=project_id, name=payload.name, jurisdiction=payload.jurisdiction,
                           category=payload.category, effective_from=payload.effective_from, effective_to=payload.effective_to,
-                          inputs=payload.inputs, formula=payload.formula, threshold=payload.threshold,
+                          version=version, inputs=payload.inputs, formula=formula, threshold=threshold,
                           status="confirmed" if payload.confirm else "draft", created_by=user.id)
     db.add(rule)
     audit(db, "compliance_rule_saved", user.id, project_id, "compliance_rule", rule.id,
@@ -966,7 +1240,10 @@ def evaluate_compliance(project_id: str, payload: ComplianceEvaluateRequest, db:
         raise HTTPException(404, "Rule or parcel not found")
     if rule.status != "confirmed":
         raise HTTPException(409, "Only an approved, versioned compliance rule can be evaluated")
-    result = compliance_result(rule, payload.values)
+    try:
+        result = compliance_result(rule, payload.values)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     audit(db, "compliance_evaluated", user.id, project_id, "compliance_rule", rule.id,
           {"parcel_entity_id": entity.id, "result": result})
     db.commit()
@@ -988,7 +1265,10 @@ def create_citizen_grant(project_id: str, payload: CitizenGrantRequest, db: Db, 
                       "recorded_area", "area_units", "geometry", "status", "capture_date"}
     if not set(payload.fields).issubset(allowed_fields):
         raise HTTPException(422, "Citizen grants can contain only approved public fields")
-    if not citizen or citizen.role != "citizen" or not entity or entity.project_id != project_id:
+    if utc_expired(payload.expires_at):
+        raise HTTPException(422, "Grant expiry must be in the future")
+    if (not citizen or citizen.role != "citizen" or not project_member(db, project_id, citizen.id)
+            or not entity or entity.project_id != project_id):
         raise HTTPException(422, "An explicit citizen account and project parcel are required")
     grant = CitizenGrant(project_id=project_id, citizen_id=citizen.id, parcel_entity_id=entity.id,
                          fields=sorted(set(payload.fields)), expires_at=payload.expires_at, granted_by=user.id)
@@ -1001,24 +1281,32 @@ def create_citizen_grant(project_id: str, payload: CitizenGrantRequest, db: Db, 
 
 @app.get("/api/projects/{project_id}/citizen-grants")
 def list_citizen_grants(project_id: str, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="citizen")
     query = select(CitizenGrant).where(CitizenGrant.project_id == project_id)
     if user.role == "citizen":
-        query = query.where(CitizenGrant.citizen_id == user.id)
-    return [citizen_grant_response(grant) for grant in db.scalars(query.order_by(CitizenGrant.created_at.desc()))]
+        query = query.where(CitizenGrant.citizen_id == user.id, CitizenGrant.status == "active")
+    grants = list(db.scalars(query.order_by(CitizenGrant.created_at.desc())))
+    if user.role == "citizen":
+        grants = [grant for grant in grants if not utc_expired(grant.expires_at)]
+    return [citizen_grant_response(grant) for grant in grants]
 
 
 @app.get("/api/projects/{project_id}/citizen-records")
 def citizen_records(project_id: str, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="citizen")
     grants = list(db.scalars(select(CitizenGrant).where(CitizenGrant.project_id == project_id,
                                                         CitizenGrant.citizen_id == user.id,
                                                         CitizenGrant.status == "active")))
+    grants = [grant for grant in grants if not utc_expired(grant.expires_at)]
     output = []
     for grant in grants:
         entity = db.get(ParcelEntity, grant.parcel_entity_id)
         selection = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == grant.parcel_entity_id))
-        if not entity or not selection:
+        published = db.scalar(select(PublicationFeature.id).join(PublishedVersion, PublishedVersion.id == PublicationFeature.version_id)
+                              .where(PublishedVersion.project_id == project_id,
+                                     PublicationFeature.parcel_entity_id == grant.parcel_entity_id,
+                                     PublishedVersion.status == "published"))
+        if not entity or not selection or not published:
             continue
         source = db.get(SourceFeature, selection.attribute_source_id)
         if not source:
@@ -1032,12 +1320,12 @@ def citizen_records(project_id: str, db: Db, user: CurrentUser):
 
 @app.post("/api/projects/{project_id}/citizen-cases", status_code=201)
 def create_citizen_case(project_id: str, payload: CitizenCaseRequest, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="citizen")
     grant = db.scalar(select(CitizenGrant).where(CitizenGrant.project_id == project_id,
                                                 CitizenGrant.citizen_id == user.id,
                                                 CitizenGrant.parcel_entity_id == payload.parcel_entity_id,
                                                 CitizenGrant.status == "active"))
-    if not grant:
+    if not grant or utc_expired(grant.expires_at):
         raise HTTPException(403, "An explicit active record grant is required")
     case = CitizenCase(project_id=project_id, grant_id=grant.id, parcel_entity_id=payload.parcel_entity_id,
                        category=payload.category, description=payload.description)
@@ -1050,7 +1338,7 @@ def create_citizen_case(project_id: str, payload: CitizenCaseRequest, db: Db, us
 
 @app.get("/api/projects/{project_id}/citizen-cases")
 def list_citizen_cases(project_id: str, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_access(db, project_id, user, capability="citizen")
     query = select(CitizenCase).where(CitizenCase.project_id == project_id)
     if user.role == "citizen":
         query = query.join(CitizenGrant, CitizenGrant.id == CitizenCase.grant_id).where(CitizenGrant.citizen_id == user.id)
@@ -1346,8 +1634,14 @@ def verify_version(project_id: str, version_id: str, db: Db, user: CurrentUser):
     version = db.get(PublishedVersion, version_id)
     if not version or version.project_id != project_id:
         raise HTTPException(404, "Published version not found")
-    manifest_bytes = json.dumps(version.lineage_manifest, sort_keys=True, separators=(",", ":"), default=str).encode()
-    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_hash = canonical_sha256(version.lineage_manifest)
+    manifest_valid = bool(version.manifest_sha256 and manifest_hash == version.manifest_sha256)
+    features = list(db.scalars(select(PublicationFeature).where(PublicationFeature.version_id == version.id)))
+    output_context = sorted([{"parcel_entity_id": feature.parcel_entity_id, "geometry": feature.geometry,
+                              "attributes": feature.attributes, "lineage": feature.lineage} for feature in features],
+                            key=lambda item: item["parcel_entity_id"] or "")
+    output_hash = canonical_sha256(output_context)
+    output_valid = bool(version.output_sha256 and output_hash == version.output_sha256)
     source_results = []
     for source in version.lineage_manifest.get("features", []):
         for item in source.get("sources", []):
@@ -1355,8 +1649,12 @@ def verify_version(project_id: str, version_id: str, db: Db, user: CurrentUser):
             actual = hashlib.sha256(__import__("pathlib").Path(dataset.raw_path).read_bytes()).hexdigest() if dataset and dataset.raw_path and __import__("pathlib").Path(dataset.raw_path).exists() else None
             source_results.append({"dataset_id": item.get("dataset_id"), "expected_sha256": item.get("sha256"),
                                   "actual_sha256": actual, "valid": actual == item.get("sha256")})
+    source_valid = bool(source_results) and all(item["valid"] for item in source_results)
     return {"version_id": version.id, "version": version.version_number, "manifest_sha256": manifest_hash,
-            "sources": source_results, "valid": all(item["valid"] for item in source_results),
+            "expected_manifest_sha256": version.manifest_sha256, "manifest_valid": manifest_valid,
+            "output_sha256": output_hash, "expected_output_sha256": version.output_sha256, "output_valid": output_valid,
+            "sources": source_results, "source_bytes_valid": source_valid,
+            "valid": manifest_valid and output_valid and source_valid,
             "immutability_scope": "canonical manifest and original upload bytes; same-database administrators are not excluded"}
 
 
@@ -1377,6 +1675,8 @@ def ogc_conformance():
 
 @app.get("/api/ogc/collections")
 def ogc_collections(db: Db, user: CurrentUser):
+    if user.role in {"field", "citizen"}:
+        raise HTTPException(403, "OGC departmental collections require a departmental read capability")
     projects = list_projects(db, user)
     return {"collections": [{"id": project.id, "title": project.name, "itemType": "feature",
                               "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
@@ -1393,7 +1693,6 @@ def ogc_items(project_id: str, db: Db, user: CurrentUser, version_id: str | None
         PublishedVersion.project_id == project_id).order_by(PublishedVersion.version_number.desc()))
     if not version or version.project_id != project_id:
         raise HTTPException(404, "Reviewed version not found")
-    features = list(db.scalars(select(PublicationFeature).where(PublicationFeature.version_id == version.id)))
     bounds = None
     if bbox:
         try:
@@ -1403,19 +1702,35 @@ def ogc_items(project_id: str, db: Db, user: CurrentUser, version_id: str | None
             bounds = values
         except ValueError as exc:
             raise HTTPException(422, "bbox must be minx,miny,maxx,maxy in CRS84") from exc
+    feature_query = select(PublicationFeature).where(PublicationFeature.version_id == version.id).order_by(PublicationFeature.id)
+    database_bbox = bool(bounds and hasattr(PublicationFeature, "spatial_geometry"))
+    if database_bbox:
+        feature_query = feature_query.where(
+            func.ST_Intersects(PublicationFeature.spatial_geometry, func.ST_MakeEnvelope(*bounds, 4326))
+        )
+    if not bounds or database_bbox:
+        matched = db.scalar(select(func.count()).select_from(feature_query.subquery())) or 0
+        features = list(db.scalars(feature_query.offset(offset).limit(limit)))
+    else:
+        features = list(db.scalars(feature_query))
+
     def inside(feature):
         if not bounds or not feature.geometry:
             return True
         from shapely.geometry import shape
         minx, miny, maxx, maxy = shape(feature.geometry).bounds
         return not (maxx < bounds[0] or minx > bounds[2] or maxy < bounds[1] or miny > bounds[3])
-    filtered = [feature for feature in features if inside(feature)]
-    page = filtered[offset:offset + limit]
+    filtered = features if database_bbox else [feature for feature in features if inside(feature)]
+    page = filtered if (not bounds or database_bbox) else filtered[offset:offset + limit]
+    if not bounds and not database_bbox:
+        matched = db.scalar(select(func.count()).where(PublicationFeature.version_id == version.id)) or 0
+    elif not database_bbox:
+        matched = len(filtered)
     return {"type": "FeatureCollection", "features": [{"type": "Feature", "id": feature.parcel_entity_id or feature.id,
              "geometry": feature.geometry, "properties": {**feature.attributes, "_lineage": feature.lineage}}
-            for feature in page], "numberMatched": len(filtered), "numberReturned": len(page),
-            "links": ([{"rel": "next", "href": f"/api/ogc/collections/{project_id}/items?version_id={version.id}&limit={limit}&offset={offset + limit}"}]
-                      if offset + limit < len(filtered) else [])}
+             for feature in page], "numberMatched": matched, "numberReturned": len(page),
+             "links": ([{"rel": "next", "href": f"/api/ogc/collections/{project_id}/items?version_id={version.id}&limit={limit}&offset={offset + limit}"}]
+                       if offset + limit < matched else [])}
 
 
 @app.post("/api/projects/{project_id}/jobs")
@@ -1436,7 +1751,8 @@ def create_job(project_id: str, job_type: str, payload: dict, background: Backgr
             if existing.configuration_hash != configuration_hash:
                 raise HTTPException(409, "Idempotency key refers to different inputs or configuration")
             return job_response(existing)
-    job = Job(project_id=project_id, job_type=job_type, payload=payload, created_by=user.id, idempotency_key=idempotency_key)
+    job = Job(project_id=project_id, job_type=job_type, payload=payload, created_by=user.id,
+              idempotency_key=idempotency_key, max_attempts=get_settings().job_max_attempts)
     job.configuration_hash = configuration_hash
     db.add(job)
     try:
@@ -1459,11 +1775,15 @@ def retry_job(project_id: str, job_id: str, background: BackgroundTasks, db: Db,
         raise HTTPException(404, "Job not found")
     if job.status != "failed":
         raise HTTPException(409, "Only failed jobs can be retried")
+    if job.attempts >= job.max_attempts:
+        raise HTTPException(409, "Job has exhausted its bounded retry attempts")
     validate_job_payload(db, project_id, job.job_type, job.payload)
     job.status = "queued"
     job.stage = "queued"
     job.cancellation_requested = False
     job.error = None
+    job.owner_token = None
+    job.lease_expires_at = None
     db.commit()
     dispatch_job(job_id, background)
     return job_response(job)
@@ -1477,8 +1797,13 @@ def cancel_job(project_id: str, job_id: str, db: Db, user: CurrentUser):
         raise HTTPException(404, "Job not found")
     if job.status in {"succeeded", "failed", "cancelled"}:
         raise HTTPException(409, "Job is already final")
-    job.cancellation_requested = True
-    job.warnings = [*(job.warnings or []), "Cancellation requested; transactional stage will not publish partial effects"]
+    if job.status == "queued":
+        job.status = "cancelled"; job.stage = "cancelled"; job.finished_at = datetime.now(timezone.utc)
+        job.cancelled_by = user.id; job.owner_token = None; job.lease_expires_at = None
+    else:
+        job.cancellation_requested = True
+        job.cancelled_by = user.id
+        job.warnings = [*(job.warnings or []), "Cancellation requested; transactional stage will not publish partial effects"]
     db.commit()
     return job_response(job)
 
@@ -1497,6 +1822,7 @@ def job_response(job: Job) -> dict:
             "configuration_hash": job.configuration_hash, "attempts": job.attempts,
             "stage": job.stage, "progress": job.progress, "heartbeat_at": job.heartbeat_at,
             "warnings": job.warnings, "cancellation_requested": job.cancellation_requested,
+            "lease_expires_at": job.lease_expires_at, "max_attempts": job.max_attempts,
             "created_at": job.created_at, "started_at": job.started_at, "finished_at": job.finished_at}
 
 

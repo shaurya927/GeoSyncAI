@@ -1,5 +1,33 @@
 # Verification — 2026-10-05
 
+## Defect-fix verification — 2026-10-06
+
+This record covers the uncommitted defect-fix work after baseline commit
+`bec97c915e64607a98d65f9cb4858a12ddc6354c`. It used fresh temporary SQLite data
+and a disposable Docker Compose project; existing `backend/geosyncai.db` and
+`backend/storage` were not used.
+
+| Check | Actual result |
+|---|---|
+| Focused regression and defect-fix tests | **22 passed, 1 skipped**, 1 warning |
+| Full system-Python backend suite | **29 passed, 2 failed, 2 skipped**; the two failures are Fiona imports unavailable in Python 3.14 |
+| Migration test in system environment | **1 passed** |
+| Postgres-container backend tests, excluding the migration subprocess test whose copied `/app/tests` path cannot see repository `migrations` | **32 passed, 1 skipped, 1 deselected**, 1 warning |
+| Python compileall | Passed |
+| Frontend typecheck | Passed |
+| Frontend production build | Passed; existing Vite large-chunk warning remains |
+| Disposable Compose build/start | Passed with API, PostGIS, Redis, Celery worker and Nginx frontend healthy |
+| Compose API health/readiness and database migration | Passed; Alembic head `0006_integrity_access_leases` |
+| Published split, lineage, OGC bbox/pagination verification | Passed in focused tests, including Postgres-container execution |
+| Independent CLI and source-tamper verification | Passed in the current local focused suite |
+
+The container migration test itself passes in the system environment. The
+container-only deselection is a test harness path issue, not an application
+failure. The remaining skipped test is the existing broker-dependent worker
+case. Browser logout/offline multi-session journeys, independent-stack restore,
+full overlapping-worker races and the complete PostGIS acceptance matrix remain
+separate follow-up checks.
+
 ## Additive Phase A-D implementation verification — 2026-10-06
 
 The working tree now includes migration `0005_raster_assets` and the additive

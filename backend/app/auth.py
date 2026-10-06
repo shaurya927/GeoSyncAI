@@ -66,18 +66,40 @@ def require_roles(*roles: str):
     return dependency
 
 
-def ensure_project_access(db: Session, project_id: str, user: User, write: bool = False, review: bool = False) -> Project:
+LIMITED_ROLES = {"field", "citizen"}
+
+
+def project_member(db: Session, project_id: str, user_id: str) -> ProjectMember | None:
+    return db.scalar(select(ProjectMember).where(ProjectMember.project_id == project_id,
+                                                  ProjectMember.user_id == user_id))
+
+
+def ensure_project_access(db: Session, project_id: str, user: User, write: bool = False, review: bool = False,
+                          capability: str = "departmental") -> Project:
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if user.role == "admin":
         return project
-    member = db.scalar(select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id))
+    member = project_member(db, project_id, user.id)
     if not member:
         raise HTTPException(status_code=403, detail="Project access denied")
+    if user.role in LIMITED_ROLES and capability not in {"project", "fieldwork", "citizen"}:
+        raise HTTPException(status_code=403, detail="This account has no departmental data-read capability")
     project_role = member.project_role
     if review and (user.role not in {"reviewer", "steward"} or project_role not in {"reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Reviewer role required")
     if write and (user.role not in {"processor", "reviewer", "steward"} or project_role not in {"processor", "reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Write access denied")
     return project
+
+
+def ensure_project_membership(db: Session, project_id: str, user: User) -> Project:
+    return ensure_project_access(db, project_id, user, capability="project")
+
+
+def utc_expired(value: datetime | None) -> bool:
+    if value is None:
+        return False
+    current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return current <= datetime.now(timezone.utc)

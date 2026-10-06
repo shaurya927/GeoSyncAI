@@ -23,6 +23,10 @@ POLICY = {"version": "reviewed-baseline-v2", "unselected": "exclude_with_reason"
           "overlap_tolerance_m2": 0.01}
 
 
+def canonical_sha256(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def candidate_snapshot(db, project):
     policy = {**POLICY, 'processing': processing_policy(db, project.id)}
     datasets = {d.id: d for d in db.scalars(select(Dataset).where(Dataset.project_id == project.id))}
@@ -35,7 +39,8 @@ def candidate_snapshot(db, project):
     reviews = list(db.scalars(select(ReviewDecision).where(ReviewDecision.project_id == project.id).order_by(ReviewDecision.id)))
     mappings = {m.id: m for m in db.scalars(select(SchemaMapping).where(SchemaMapping.project_id == project.id))}
     selections = list(db.scalars(select(ParcelSelection).join(ParcelEntity, ParcelEntity.id == ParcelSelection.parcel_entity_id)
-                                 .where(ParcelEntity.project_id == project.id).order_by(ParcelSelection.parcel_entity_id)))
+                                 .where(ParcelEntity.project_id == project.id, ParcelEntity.status == "active")
+                                 .order_by(ParcelSelection.parcel_entity_id)))
     failures, excluded, output = [], [], []
     # Unresolved source references are a project-wide spatial publication gate.
     for d in datasets.values():
@@ -80,17 +85,20 @@ def candidate_snapshot(db, project):
                 applied.append(change.id)
             else:
                 failures.append({"change_id": change.id, "reason": "Unresolved change affects selected baseline"})
+        applied_geometry_changes = []
         for geometry_change in geometry_changes:
-            if selection.parcel_entity_id not in (geometry_change.parcel_entity_ids or []):
+            affected_ids = set(geometry_change.parcel_entity_ids or []) | set(geometry_change.successor_ids or [])
+            if selection.parcel_entity_id not in affected_ids:
                 continue
             if geometry_change.status in {"draft", "deferred"}:
                 failures.append({"geometry_change_set_id": geometry_change.id, "reason": "Unresolved geometry changeset affects selected baseline"})
             elif geometry_change.status == "approved":
-                if geometry_change.operation in {"move", "shared_edge"} and selection.parcel_entity_id in (geometry_change.approved_geometries or {}):
+                if selection.parcel_entity_id in (geometry_change.approved_geometries or {}):
                     geometry = geometry_change.approved_geometries[selection.parcel_entity_id]
-                elif geometry_change.operation in {"split", "merge"}:
+                    applied_geometry_changes.append(geometry_change)
+                else:
                     failures.append({"geometry_change_set_id": geometry_change.id,
-                                     "reason": "Split/merge requires separately selected successor baselines before publication"})
+                                     "reason": "Approved geometry changeset has no geometry for the selected parcel"})
         match_ids = sorted(m.id for m in matches if m.left_feature_id in members and m.right_feature_id in members)
         review_ids = sorted(r.id for r in reviews if (r.target_type == "match" and r.target_id in match_ids) or (r.target_type == "change" and r.target_id in applied + rejected))
         source_lineage = []
@@ -108,8 +116,14 @@ def candidate_snapshot(db, project):
         lineage = {"parcel_entity_id": selection.parcel_entity_id, "source_feature_ids": members,
                    "sources": source_lineage, "accepted_match_proposal_ids": match_ids,
                    "matching_evidence": [{"id": m.id, "method": m.model_version, "evidence": m.evidence} for m in matches if m.id in match_ids],
-                   "accepted_change_ids": applied, "rejected_change_ids": rejected, "review_decisions": review_ids,
-                   "selection": {"id": selection.id, "revision": selection.revision, "actor_id": selection.actor_id,
+                    "accepted_change_ids": applied, "rejected_change_ids": rejected, "review_decisions": review_ids,
+                    "geometry_changes": [{"id": item.id, "revision": item.revision, "operation": item.operation,
+                                          "predecessor_ids": item.predecessor_ids, "successor_ids": item.successor_ids,
+                                          "before_geometries": item.before_geometries, "approved_geometries": item.approved_geometries,
+                                          "measurements": item.measurements, "authorization": item.authorization,
+                                          "approved_by": item.approved_by, "decision_at": item.decision_at.isoformat() if item.decision_at else None,
+                                          "decision_rationale": item.decision_rationale} for item in applied_geometry_changes],
+                    "selection": {"id": selection.id, "revision": selection.revision, "actor_id": selection.actor_id,
                                  "rationale": selection.rationale, "geometry_source_id": selection.geometry_source_id,
                                  "attribute_source_id": selection.attribute_source_id, "attribute_sources": selection.attribute_sources},
                    "crs_transformations": [s["crs_transformation"] for s in source_lineage if s["crs_transformation"]]}
@@ -185,10 +199,15 @@ def publish(db, project, actor):
     report = project.validation_report or {}
     if not report.get("valid") or report.get("candidate_hash") != digest or project.validated_revision != project.workflow_revision:
         raise ValueError("Candidate revision changed or has not passed validation; validate again")
+    lineage_manifest = {"policy": POLICY, "candidate_hash": digest, "validation_report": report,
+                        "features": [c["lineage"] for c in candidates], "exclusions": excluded}
+    output_context = sorted([{"parcel_entity_id": c["parcel_entity_id"], "geometry": c["geometry"],
+                              "attributes": c["attributes"], "lineage": c["lineage"]} for c in candidates],
+                            key=lambda item: item["parcel_entity_id"] or "")
     version = PublishedVersion(project_id=project.id, version_number=next_version(db, project.id), created_by=actor.id,
                                project_revision=project.workflow_revision, validation_report=report,
-                               excluded_records=excluded, lineage_manifest={"policy": POLICY, "candidate_hash": digest,
-                               "validation_report": report, "features": [c["lineage"] for c in candidates], "exclusions": excluded})
+                               excluded_records=excluded, lineage_manifest=lineage_manifest,
+                               manifest_sha256=canonical_sha256(lineage_manifest), output_sha256=canonical_sha256(output_context))
     db.add(version)
     db.flush()
     for candidate in candidates:

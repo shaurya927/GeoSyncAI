@@ -231,6 +231,9 @@ class PublishedVersion(Base):
     excluded_records: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     validation_report: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     lineage_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -271,6 +274,10 @@ class Job(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
     cancellation_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    owner_token: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    cancelled_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
 
 class AuditEvent(Base):
@@ -355,6 +362,9 @@ class GeometryChangeSet(Base):
     authorization: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     rationale: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    decision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -364,11 +374,14 @@ class GroundControlSession(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
     method: Mapped[str] = mapped_column(String(40))
+    source_crs: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    target_crs: Mapped[str | None] = mapped_column(String(120), nullable=True)
     control_points: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     residuals: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="draft")
     revision: Mapped[int] = mapped_column(Integer, default=1)
     approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    approved_dataset_id: Mapped[str | None] = mapped_column(ForeignKey("datasets.id"), nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

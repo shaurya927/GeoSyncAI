@@ -153,6 +153,9 @@ class GeometryChangeSetRequest(BaseModel):
     parcel_entity_ids: list[str] = Field(min_length=1, max_length=100)
     draft_geometries: dict[str, dict[str, Any]] = Field(default_factory=dict)
     successor_ids: list[str] = Field(default_factory=list)
+    attribute_source_id: str | None = None
+    attribute_sources: dict[str, str] = Field(default_factory=dict)
+    attribute_overrides: dict[str, Any] = Field(default_factory=dict)
     rationale: str = Field(min_length=1, max_length=2000)
     authorization: dict[str, Any] = Field(default_factory=dict)
 
@@ -167,13 +170,22 @@ class MeasurementRequest(BaseModel):
     geometry: dict[str, Any]
     source_crs: str = "EPSG:4326"
     analysis_crs: str | None = None
+    method: Literal["projected", "geodesic", "display"] = "projected"
     purpose: Literal["display", "analysis", "cadastral_review"] = "analysis"
 
 
 class GroundControlRequest(BaseModel):
     dataset_id: str
     method: Literal["translation", "similarity", "affine"] = "affine"
-    control_points: list[dict[str, Any]] = Field(min_length=2)
+    source_crs: str | None = None
+    target_crs: str | None = None
+    max_checkpoint_residual: float = Field(default=1.0, gt=0)
+    control_points: list[dict[str, Any]] = Field(min_length=1)
+
+
+class GroundControlApprovalRequest(BaseModel):
+    expected_revision: int = Field(default=1, ge=1)
+    rationale: str = Field(min_length=1, max_length=2000)
 
 
 class TrainingExampleRequest(BaseModel):
@@ -218,6 +230,9 @@ class ComplianceRuleRequest(BaseModel):
     inputs: list[dict[str, Any]] = Field(default_factory=list)
     formula: dict[str, Any] = Field(default_factory=dict)
     threshold: dict[str, Any] = Field(default_factory=dict)
+    operator: Literal["<", "<=", ">", ">=", "==", "between", "ratio_le", "ratio_ge"] | None = None
+    units: str | None = None
+    reference: str | None = None
     confirm: bool = False
 
 
@@ -225,6 +240,13 @@ class ComplianceEvaluateRequest(BaseModel):
     parcel_entity_id: str
     rule_id: str
     values: dict[str, Any] = Field(default_factory=dict)
+
+
+class FieldEvidenceResolutionRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    decision: Literal["accept", "reject", "resubmit"]
+    rationale: str = Field(min_length=1, max_length=2000)
+    new_expected_project_revision: int | None = Field(default=None, ge=0)
 
 
 class CitizenGrantRequest(BaseModel):

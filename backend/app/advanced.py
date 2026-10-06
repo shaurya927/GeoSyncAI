@@ -10,15 +10,17 @@ import hashlib
 import json
 import math
 import re
+from datetime import date
 from typing import Any
 
 import numpy as np
 from shapely.geometry import shape, mapping
+from pyproj import CRS, Geod
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import (Dataset, ModelArtifact, ParcelEntity, ParcelSourceLink,
+from .models import (Dataset, ModelArtifact, ParcelEntity, ParcelSelection, ParcelSourceLink,
                      ReconciliationCase, SourceFeature, TrainingExample)
 from .services import audit, analysis_crs_for, metric_geometry, touch_project
 from .spatial import check_coordinates, reproject
@@ -92,66 +94,136 @@ def build_reconciliation(db: Session, project_id: str, feature_ids: list[str], a
     return case
 
 
-def measure_geometry(geometry_data: dict[str, Any], source_crs: str, analysis_crs: str | None, purpose: str) -> dict[str, Any]:
+def measure_geometry(geometry_data: dict[str, Any], source_crs: str, analysis_crs: str | None,
+                     purpose: str, method: str = "projected") -> dict[str, Any]:
     geometry = shape(geometry_data)
-    check_coordinates(geometry, geographic=__import__("pyproj").CRS(source_crs).is_geographic)
+    try:
+        source = CRS.from_user_input(source_crs)
+    except Exception as exc:
+        raise ValueError(f"Invalid source CRS: {source_crs}") from exc
+    check_coordinates(geometry, geographic=source.is_geographic)
     if geometry.is_empty:
         raise ValueError("Empty geometry cannot be measured")
     bounds = geometry.bounds
     extent_gate: list[str] = []
-    if __import__("pyproj").CRS(source_crs).is_geographic and bounds[2] - bounds[0] > 180:
+    display_geometry = geometry if source.to_string() == "EPSG:4326" else reproject(geometry, source_crs, "EPSG:4326")
+    display_bounds = display_geometry.bounds
+    if source.is_geographic and display_bounds[2] - display_bounds[0] > 180:
         extent_gate.append("antimeridian_spanning_geometry_requires_explicit_split")
     if geometry.has_z:
         extent_gate.append("vertical_reference_not_supplied; Z is not used for area")
-    if purpose == "cadastral_review" and not analysis_crs:
-        extent_gate.append("explicit_projected_analysis_crs_required_for_cadastral_review")
-    chosen = analysis_crs or (analysis_crs_for(reproject(geometry, source_crs, "EPSG:4326")) if source_crs != "EPSG:4326" else analysis_crs_for(geometry))
-    if not chosen:
-        raise ValueError("A projected analysis CRS is required")
-    metric = reproject(geometry, source_crs, chosen)
-    result = {"source_crs": source_crs, "analysis_crs": chosen, "axis_order": "always_xy",
-              "purpose": purpose, "extent": {"min_x": bounds[0], "min_y": bounds[1], "max_x": bounds[2], "max_y": bounds[3]},
-              "area_m2": metric.area if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
-              "length_m": metric.length, "perimeter_m": metric.length if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
-              "gates": extent_gate, "display_geometry": mapping(reproject(geometry, source_crs, "EPSG:4326")) if source_crs != "EPSG:4326" else geometry_data}
+    if purpose == "display" or method == "display":
+        return {"source_crs": source_crs, "analysis_crs": None, "axis_order": "always_xy", "purpose": purpose,
+                "method": "display_only", "extent": {"min_x": display_bounds[0], "min_y": display_bounds[1],
+                "max_x": display_bounds[2], "max_y": display_bounds[3]}, "area_m2": None, "length_m": None,
+                "perimeter_m": None, "units": None, "gates": ["display_only_not_a_metric_or_cadastral_measurement"],
+                "display_geometry": mapping(display_geometry), "publishable_measurement": False}
+    if method == "geodesic":
+        if display_bounds[2] - display_bounds[0] > 180:
+            raise ValueError("Geodesic antimeridian-spanning measurement requires an explicit split")
+        geod = Geod(ellps="WGS84")
+        try:
+            area, perimeter = geod.geometry_area_perimeter(display_geometry)
+        except Exception as exc:
+            raise ValueError("Geodesic measurement requires a supported polygon/line geometry") from exc
+        return {"source_crs": source_crs, "analysis_crs": "WGS84 ellipsoid", "axis_order": "always_xy",
+                "purpose": purpose, "method": "geodesic_wgs84", "extent": {"min_x": display_bounds[0], "min_y": display_bounds[1],
+                "max_x": display_bounds[2], "max_y": display_bounds[3]}, "area_m2": abs(area) if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
+                "length_m": perimeter, "perimeter_m": perimeter if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
+                "units": "metres", "gates": extent_gate, "display_geometry": mapping(display_geometry),
+                "publishable_measurement": not extent_gate}
+    try:
+        target = CRS.from_user_input(analysis_crs) if analysis_crs else (source if source.is_projected else CRS.from_user_input(analysis_crs_for(display_geometry)))
+    except Exception as exc:
+        raise ValueError("Invalid or unavailable projected analysis CRS") from exc
+    if not target.is_projected:
+        raise ValueError("A geographic analysis CRS cannot be used for metric area/length; choose projected or geodesic method")
+    if source.is_geographic and display_bounds[2] - display_bounds[0] > 6 and not analysis_crs:
+        raise ValueError("Automatic local UTM measurement is gated for multi-zone extents; supply an explicit analysis CRS")
+    area_of_use = target.area_of_use
+    if area_of_use and not (area_of_use.west <= display_bounds[0] and area_of_use.east >= display_bounds[2]
+                            and area_of_use.south <= display_bounds[1] and area_of_use.north >= display_bounds[3]):
+        raise ValueError("Geometry lies outside the selected analysis CRS area of use")
+    chosen = target.to_string()
+    metric = geometry if source == target else reproject(geometry, source_crs, chosen)
+    unit_factor = target.axis_info[0].unit_conversion_factor if target.axis_info else 1.0
+    if not unit_factor or not math.isfinite(unit_factor):
+        raise ValueError("Analysis CRS has no finite linear-unit conversion")
+    result = {"source_crs": source_crs, "analysis_crs": chosen, "axis_order": "always_xy", "purpose": purpose,
+              "method": "projected", "extent": {"min_x": display_bounds[0], "min_y": display_bounds[1],
+              "max_x": display_bounds[2], "max_y": display_bounds[3]},
+              "area_m2": metric.area * unit_factor ** 2 if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
+              "length_m": metric.length * unit_factor, "perimeter_m": metric.length * unit_factor if geometry.geom_type in {"Polygon", "MultiPolygon"} else None,
+              "analysis_units": target.axis_info[0].unit_name if target.axis_info else "unknown",
+              "unit_conversion_to_m": unit_factor, "units": "metres", "gates": extent_gate, "display_geometry": mapping(display_geometry),
+              "publishable_measurement": not extent_gate}
     if extent_gate and purpose == "cadastral_review":
         result["publishable_measurement"] = False
-    else:
-        result["publishable_measurement"] = True
     return result
 
 
-def fit_control_points(method: str, control_points: list[dict[str, Any]]) -> dict[str, Any]:
-    """Fit a documented 2D transform without changing retained source bytes."""
-    source = np.array([point["source"][:2] for point in control_points], dtype=float)
-    target = np.array([point["target"][:2] for point in control_points], dtype=float)
+def fit_control_points(method: str, fitting_points: list[dict[str, Any]], checkpoints: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Fit a 2D transform using only fitting points; checkpoints are never in the fit."""
+    checkpoints = checkpoints or []
+    if not fitting_points:
+        raise ValueError("At least one non-checkpoint control is required")
+    try:
+        source = np.array([point["source"][:2] for point in fitting_points], dtype=float)
+        target = np.array([point["target"][:2] for point in fitting_points], dtype=float)
+        check_source = np.array([point["source"][:2] for point in checkpoints], dtype=float)
+        check_target = np.array([point["target"][:2] for point in checkpoints], dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Control points need finite source and target coordinate pairs") from exc
+    if not np.isfinite(source).all() or not np.isfinite(target).all() or (len(checkpoints) and (not np.isfinite(check_source).all() or not np.isfinite(check_target).all())):
+        raise ValueError("Control points must contain finite coordinates")
     if method == "translation":
+        if len(fitting_points) < 1:
+            raise ValueError("Translation fitting requires one control")
         translation = np.mean(target - source, axis=0)
         predicted = source + translation
+        check_predicted = check_source + translation
         parameters: dict[str, Any] = {"translation": translation.tolist()}
     elif method == "similarity":
-        if len(control_points) < 2:
-            raise ValueError("Similarity fitting requires at least two points")
-        matrix = np.column_stack((source[:, 0], -source[:, 1], np.ones(len(source))))
-        x = np.linalg.lstsq(matrix, target[:, 0], rcond=None)[0]
-        y = np.linalg.lstsq(np.column_stack((source[:, 1], source[:, 0], np.ones(len(source)))), target[:, 1], rcond=None)[0]
-        predicted = np.column_stack((matrix @ x, np.column_stack((source[:, 1], source[:, 0], np.ones(len(source)))) @ y))
-        parameters = {"a": float(x[0]), "b": float(y[1]), "tx": float(x[2]), "ty": float(y[2]),
-                      "scale": float(math.hypot(x[0], y[1])), "rotation_rad": float(math.atan2(y[1], x[0]))}
-    else:
-        if len(control_points) < 3:
-            raise ValueError("Affine fitting requires at least three points")
+        if len(fitting_points) < 2 or np.linalg.matrix_rank(source[1:] - source[0]) < 1:
+            raise ValueError("Similarity fitting requires two distinct controls")
+        design = np.zeros((len(fitting_points) * 2, 4))
+        design[0::2, :] = np.column_stack((source[:, 0], -source[:, 1], np.ones(len(source)), np.zeros(len(source))))
+        design[1::2, :] = np.column_stack((source[:, 1], source[:, 0], np.zeros(len(source)), np.ones(len(source))))
+        targets = target.reshape(-1)
+        if np.linalg.matrix_rank(design) < 4:
+            raise ValueError("Similarity controls are geometrically degenerate")
+        coefficients = np.linalg.lstsq(design, targets, rcond=None)[0]
+        a, b, tx, ty = coefficients
+        predicted = np.column_stack((a * source[:, 0] - b * source[:, 1] + tx,
+                                      b * source[:, 0] + a * source[:, 1] + ty))
+        check_predicted = np.column_stack((a * check_source[:, 0] - b * check_source[:, 1] + tx,
+                                            b * check_source[:, 0] + a * check_source[:, 1] + ty)) if len(checkpoints) else np.empty((0, 2))
+        parameters = {"a": float(a), "b": float(b), "tx": float(tx), "ty": float(ty),
+                      "scale": float(math.hypot(a, b)), "rotation_rad": float(math.atan2(b, a))}
+    elif method == "affine":
+        if len(fitting_points) < 3:
+            raise ValueError("Affine fitting requires at least three controls")
         design = np.column_stack((source, np.ones(len(source))))
+        if np.linalg.matrix_rank(design) < 3:
+            raise ValueError("Affine controls are collinear or geometrically degenerate")
         x = np.linalg.lstsq(design, target[:, 0], rcond=None)[0]
         y = np.linalg.lstsq(design, target[:, 1], rcond=None)[0]
         predicted = np.column_stack((design @ x, design @ y))
+        check_design = np.column_stack((check_source, np.ones(len(check_source)))) if len(checkpoints) else np.empty((0, 3))
+        check_predicted = np.column_stack((check_design @ x, check_design @ y)) if len(checkpoints) else np.empty((0, 2))
         parameters = {"x": x.tolist(), "y": y.tolist()}
-    residuals = np.linalg.norm(predicted - target, axis=1)
-    checkpoints = [float(residuals[index]) for index, point in enumerate(control_points) if point.get("checkpoint")]
-    return {"method": method, "parameters": parameters, "residuals": [float(value) for value in residuals],
-            "rms": float(math.sqrt(np.mean(residuals ** 2))), "max": float(np.max(residuals)),
-            "independent_checkpoints": len(checkpoints), "checkpoint_rms": float(math.sqrt(np.mean(np.square(checkpoints)))) if checkpoints else None,
-            "checkpoint_max": max(checkpoints) if checkpoints else None,
+    else:
+        raise ValueError(f"Unsupported control-point method: {method}")
+    fit_residuals = np.linalg.norm(predicted - target, axis=1)
+    checkpoint_residuals = np.linalg.norm(check_predicted - check_target, axis=1) if len(checkpoints) else np.array([])
+    return {"method": method, "parameters": parameters,
+            "fitting_residuals": [float(value) for value in fit_residuals],
+            "fitting_rms": float(math.sqrt(np.mean(fit_residuals ** 2))),
+            "fitting_max": float(np.max(fit_residuals)), "fitting_count": len(fitting_points),
+            "checkpoint_residuals": [float(value) for value in checkpoint_residuals],
+            "checkpoint_rms": float(math.sqrt(np.mean(np.square(checkpoint_residuals)))) if len(checkpoints) else None,
+            "checkpoint_max": float(np.max(checkpoint_residuals)) if len(checkpoints) else None,
+            "checkpoint_count": len(checkpoints),
             "extrapolation_gate": "control-point hull only; outside-hull application requires independent evidence"}
 
 
@@ -163,26 +235,28 @@ def geometry_measurements(db: Session, parcel_ids: list[str], draft_geometries: 
     entities = {entity.id: entity for entity in db.scalars(select(ParcelEntity).where(ParcelEntity.id.in_(parcel_ids)))}
     links = list(db.scalars(select(ParcelSourceLink).where(ParcelSourceLink.parcel_entity_id.in_(parcel_ids))))
     sources = {feature.id: feature for feature in db.scalars(select(SourceFeature).where(SourceFeature.id.in_([link.source_feature_id for link in links])))}
+    selections = {selection.parcel_entity_id: selection for selection in db.scalars(select(ParcelSelection).where(ParcelSelection.parcel_entity_id.in_(parcel_ids)))}
     for parcel_id in parcel_ids:
-        entity_links = [link for link in links if link.parcel_entity_id == parcel_id]
         geometry = None
-        for link in entity_links:
-            if sources[link.source_feature_id].normalized_geometry:
-                geometry = shape(sources[link.source_feature_id].normalized_geometry)
-                break
+        selection = selections.get(parcel_id)
+        if selection and selection.geometry_source_id:
+            selected_source = db.get(SourceFeature, selection.geometry_source_id)
+            if selected_source and selected_source.normalized_geometry:
+                geometry = shape(selected_source.normalized_geometry)
         if geometry is not None:
             chosen = analysis_crs_for(geometry)
             before[parcel_id] = metric_geometry(geometry, chosen).area
             before_geometries[parcel_id] = mapping(geometry)
-        if parcel_id in draft_geometries:
-            draft = shape(draft_geometries[parcel_id])
-            check_coordinates(draft, True)
-            if not draft.is_valid or draft.geom_type not in {"Polygon", "MultiPolygon"}:
-                raise ValueError(f"Draft geometry for {parcel_id} must be a valid polygon")
-            chosen = analysis_crs_for(draft)
-            after[parcel_id] = metric_geometry(draft, chosen).area
-            if geometry is not None:
-                max_displacement = max(max_displacement, metric_geometry(geometry, chosen).hausdorff_distance(metric_geometry(draft, chosen)))
+    for draft_id, draft_data in draft_geometries.items():
+        draft = shape(draft_data)
+        check_coordinates(draft, True)
+        if not draft.is_valid or draft.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise ValueError(f"Draft geometry for {draft_id} must be a valid polygon")
+        chosen = analysis_crs_for(draft)
+        after[draft_id] = metric_geometry(draft, chosen).area
+        if draft_id in before_geometries:
+            baseline = shape(before_geometries[draft_id])
+            max_displacement = max(max_displacement, metric_geometry(baseline, chosen).hausdorff_distance(metric_geometry(draft, chosen)))
     return {"before_area_m2": before, "after_area_m2": after, "before_geometries": before_geometries,
             "area_delta_m2": sum(after.values()) - sum(before.values()),
             "area_conservation_delta_m2": sum(after.values()) - sum(before.values()),
@@ -277,7 +351,39 @@ def parse_structured_query(query: str) -> dict[str, Any]:
     return result
 
 
+SUPPORTED_COMPLIANCE_OPERATORS = {"<", "<=", ">", ">=", "==", "between", "ratio_le", "ratio_ge"}
+
+
+def validate_compliance_rule(rule_data: dict[str, Any]) -> None:
+    formula = rule_data.get("formula") or {}
+    threshold = rule_data.get("threshold") or {}
+    operator = rule_data.get("operator") or formula.get("operator") or threshold.get("operator") or "<="
+    if operator not in SUPPORTED_COMPLIANCE_OPERATORS:
+        raise ValueError(f"Unsupported compliance operator: {operator}")
+    if operator == "between" and (threshold.get("min") is None or threshold.get("max") is None):
+        raise ValueError("A between rule requires min and max thresholds")
+    if operator != "between" and threshold.get("value", threshold.get("max", threshold.get("min"))) is None:
+        raise ValueError("A compliance rule requires an explicit threshold")
+    for value in (threshold.get("value"), threshold.get("min"), threshold.get("max")):
+        if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(float(value))):
+            raise ValueError("Compliance thresholds must be finite numbers")
+
+
+def _convert_units(value: float, source_units: str | None, target_units: str | None) -> float:
+    if not source_units or not target_units or source_units == target_units:
+        return value
+    factors = {"m": 1.0, "metre": 1.0, "metres": 1.0, "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
+               "m2": 1.0, "m²": 1.0, "sq_m": 1.0, "ft2": 0.09290304, "sqft": 0.09290304, "sq_ft": 0.09290304}
+    source_factor, target_factor = factors.get(source_units.casefold()), factors.get(target_units.casefold())
+    if source_factor is None or target_factor is None:
+        raise ValueError(f"Unsupported or incompatible units: {source_units} -> {target_units}")
+    return value * source_factor / target_factor
+
+
 def compliance_result(rule: Any, values: dict[str, Any]) -> dict[str, Any]:
+    today = date.today()
+    if (rule.effective_from and today < rule.effective_from) or (rule.effective_to and today > rule.effective_to):
+        return {"status": "not_applicable", "reason": "Rule is outside its effective date range", "rule_id": rule.id, "rule_version": rule.version}
     required = [str(item.get("name")) for item in (rule.inputs or []) if item.get("required", True)]
     missing = [name for name in required if values.get(name) in (None, "")]
     if missing:
@@ -285,17 +391,39 @@ def compliance_result(rule: Any, values: dict[str, Any]) -> dict[str, Any]:
     formula = rule.formula or {}
     operation = formula.get("operation", rule.category)
     threshold = rule.threshold or {}
+    operator = formula.get("operator") or threshold.get("operator") or "<="
+    if operator not in SUPPORTED_COMPLIANCE_OPERATORS:
+        raise ValueError(f"Unsupported compliance operator: {operator}")
+    applies_if = formula.get("applies_if") or {}
+    if any(values.get(key) != expected for key, expected in applies_if.items()):
+        return {"status": "not_applicable", "reason": "Applicability conditions are not met", "rule_id": rule.id, "rule_version": rule.version}
     if operation in {"far", "fsi"} and values.get("floor_area_m2") is None:
         return {"status": "insufficient_information", "missing_inputs": ["floor_area_m2"], "explanation": "FAR/FSI cannot be inferred from footprint"}
     actual_name = formula.get("actual", "value")
     actual = values.get(actual_name)
-    limit = threshold.get("max", threshold.get("value"))
-    if actual is None or limit is None:
-        return {"status": "insufficient_information", "missing_inputs": [actual_name, "threshold"], "rule_id": rule.id}
+    if operation in {"far", "fsi"} and actual is None:
+        if values.get("plot_area_m2") in (None, 0):
+            return {"status": "insufficient_information", "missing_inputs": ["plot_area_m2"], "rule_id": rule.id}
+        actual = float(values["floor_area_m2"]) / float(values["plot_area_m2"])
+        actual_name = "floor_area_m2 / plot_area_m2"
+    threshold_units = threshold.get("units")
+    input_units = next((item.get("units") for item in (rule.inputs or []) if item.get("name") == actual_name), threshold_units)
+    if actual is None:
+        return {"status": "insufficient_information", "missing_inputs": [actual_name], "rule_id": rule.id}
     try:
-        passed = float(actual) <= float(limit)
-    except (TypeError, ValueError):
+        actual = _convert_units(float(actual), input_units, threshold_units)
+        if operator == "between":
+            passed = _convert_units(float(threshold["min"]), threshold_units, threshold_units) <= actual <= _convert_units(float(threshold["max"]), threshold_units, threshold_units)
+            limit: Any = {"min": threshold["min"], "max": threshold["max"]}
+        elif operator in {"ratio_le", "ratio_ge"}:
+            limit = float(threshold.get("value", threshold.get("max")))
+            passed = actual <= limit if operator == "ratio_le" else actual >= limit
+        else:
+            limit = float(threshold.get("value", threshold.get("max", threshold.get("min"))))
+            passed = {"<": actual < limit, "<=": actual <= limit, ">": actual > limit,
+                      ">=": actual >= limit, "==": math.isclose(actual, limit, rel_tol=1e-9, abs_tol=1e-9)}[operator]
+    except (TypeError, ValueError, KeyError):
         return {"status": "insufficient_information", "explanation": "Inputs must be numeric", "rule_id": rule.id}
     return {"status": "pass" if passed else "potential_violation", "actual": actual, "threshold": limit,
-            "units": threshold.get("units"), "rule_id": rule.id, "rule_version": rule.version,
-            "explanation": f"{actual_name}={actual} compared with configured maximum {limit}"}
+            "operator": operator, "units": threshold.get("units"), "rule_id": rule.id, "rule_version": rule.version,
+            "explanation": f"{actual_name}={actual} compared with configured operator {operator} and threshold {limit}"}
