@@ -10,6 +10,8 @@
   validation and immutable feature snapshots. `policy.py` loads append-only policy
   revisions from audited commands.
 - `tasks.py`: transactional durable stages; local executor or Redis/Celery.
+- `advanced.py`: explicit multi-source evidence, bounded measurement, grouped
+  supervised ranker, fieldwork/query/compliance helpers and audit verification.
 - SQLAlchemy persistence with native PostGIS geometry/GiST when using PostgreSQL;
   GeoJSON-compatible JSON remains available in both storage profiles.
 
@@ -40,8 +42,19 @@ revision. This separates identity, geometry, attributes and approval status.
 mapping/CRS/matching/review lineage, the exact validation report and exclusions.
 Restoring a historical version copies its snapshot into a new numbered version.
 `AuditEvent` retains mutations and policy/validation history. `Job` retains input/
-configuration hashes, attempts, result and errors; each receipt represents a
-single transactionally committed processing stage.
+configuration hashes, attempts, result/errors, stage, heartbeat, warnings and
+cancellation state; each processing result is committed transactionally with its
+effects. `MappingDictionaryEntry` and `DepartmentTemplate` keep bilingual,
+versioned semantic terms and reusable source contracts. `ReconciliationCase`
+stores independent three-plus-source evidence, competing values and authorized
+overrides without creating identity membership. `GeometryChangeSet` stores draft
+versus approved operations, predecessor/successor lineage, measurements and
+authorization. `GroundControlSession` stores paired controls/residuals and
+checkpoint approval. `TrainingExample`/`ModelArtifact` keep grouped labels,
+features, seeds, fingerprints and reliability metrics. `FieldAssignment` and
+`FieldEvidence` implement bounded idempotent fieldwork; `ComplianceRule`,
+`CitizenGrant` and `CitizenCase` keep versioned rules and explicit citizen access.
+`RasterAsset` stores a hash-verified, permissioned source with attribution.
 
 ## Publication policy
 
@@ -50,6 +63,11 @@ single transactionally committed processing stage.
 - Unknown/implausible CRS is a project-wide spatial publication blocker.
 - Confirmed schema mappings are required for included source links.
 - Accepting identity never chooses/merges a boundary or an attribute value.
+- A reconciliation recommendation is evidence, not ownership adjudication; all
+  source memberships and per-field provenance remain explicit.
+- Geometry edits are draft artifacts until a reviewer decision and subsequent
+  candidate validation; originals are never changed. Split/merge successor
+  publication remains an explicit, separately reviewed identity revision.
 - Pending/deferred changes touching included parcels block publication.
 - Rejection does not apply the rejected edit; the selected baseline is retained.
 - Accepted edits are assembled into the candidate, then validated together with
@@ -82,6 +100,20 @@ coverage polygon. Valid source holes are preserved. General shared-boundary
 reconstruction and approved split/merge editing remain limitations; no automatic
 repair or cadastral correctness is claimed.
 
+Measurement responses expose display CRS, projected analysis CRS, axis order,
+extent gates, units and vertical-reference limitations. The UI can show MapLibre
+extrusions only for positive metre heights accompanied by a height source and
+vertical reference; otherwise it remains a 2D footprint. GeoTIFF/COG registration
+is bounded, attributed and permissioned; deployment-specific GDAL tile rendering
+is not silently substituted by a fake tile endpoint.
+
+The structured query endpoint produces a whitelisted read-only plan for Hindi or
+English phrases and applies project scope and result limits. It never accepts
+model-generated SQL or permits mutation. Fieldwork synchronizes only assigned
+parcel IDs with an idempotency key and compares the project revision; a conflict
+retains the draft for officer resolution. Citizen records require explicit
+verified local-demo grants and a public-field allowlist.
+
 ## Technical references used
 
 - [pyproj Transformer and TransformerGroup](https://pyproj4.github.io/pyproj/stable/api/transformer.html):
@@ -96,6 +128,13 @@ server-checked reviews/publication and authenticated downloads. Demonstration
 accounts are opt-in. Upload/archive limits are configurable. Raw records are not
 sent to external AI/model services. Optional basemap requests are browser tile
 requests, not uploads of source records.
+
+`/api/ogc` exposes the tested read-only OGC API - Features landing, core
+conformance, collections, items, bbox and pagination paths for reviewed versions.
+`/versions/{id}/verify` independently recalculates the canonical manifest hash and
+checks source upload hashes. This is tamper evidence for stored artifacts, not
+administrator-proof immutability; signatures or an external ledger remain
+conditional deployment capabilities.
 
 This is still a prototype: do not equate its audit log with legal certification,
 or its synthetic evaluation with operational cadastral accuracy.

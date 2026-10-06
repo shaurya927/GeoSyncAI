@@ -12,8 +12,8 @@ from shapely.geometry import shape
 from shapely.strtree import STRtree
 
 from .models import (ChangeProposal, Dataset, MatchProposal, ParcelEntity, ParcelSelection,
-                     ParcelSourceLink, PublicationFeature, PublishedVersion, ReviewDecision,
-                     SchemaMapping, SourceFeature)
+                      ParcelSourceLink, PublicationFeature, PublishedVersion, ReviewDecision,
+                      SchemaMapping, SourceFeature, GeometryChangeSet)
 from .services import audit, metric_geometry, next_version, spatial_column
 from .spatial import check_coordinates
 from .policy import processing_policy
@@ -30,6 +30,8 @@ def candidate_snapshot(db, project):
     links = list(db.scalars(select(ParcelSourceLink).where(ParcelSourceLink.project_id == project.id)))
     matches = list(db.scalars(select(MatchProposal).where(MatchProposal.project_id == project.id, MatchProposal.status == "accepted")))
     changes = list(db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project.id, ChangeProposal.status != "superseded").order_by(ChangeProposal.created_at, ChangeProposal.id)))
+    geometry_changes = list(db.scalars(select(GeometryChangeSet).where(GeometryChangeSet.project_id == project.id)
+                                      .order_by(GeometryChangeSet.created_at, GeometryChangeSet.id)))
     reviews = list(db.scalars(select(ReviewDecision).where(ReviewDecision.project_id == project.id).order_by(ReviewDecision.id)))
     mappings = {m.id: m for m in db.scalars(select(SchemaMapping).where(SchemaMapping.project_id == project.id))}
     selections = list(db.scalars(select(ParcelSelection).join(ParcelEntity, ParcelEntity.id == ParcelSelection.parcel_entity_id)
@@ -78,6 +80,17 @@ def candidate_snapshot(db, project):
                 applied.append(change.id)
             else:
                 failures.append({"change_id": change.id, "reason": "Unresolved change affects selected baseline"})
+        for geometry_change in geometry_changes:
+            if selection.parcel_entity_id not in (geometry_change.parcel_entity_ids or []):
+                continue
+            if geometry_change.status in {"draft", "deferred"}:
+                failures.append({"geometry_change_set_id": geometry_change.id, "reason": "Unresolved geometry changeset affects selected baseline"})
+            elif geometry_change.status == "approved":
+                if geometry_change.operation in {"move", "shared_edge"} and selection.parcel_entity_id in (geometry_change.approved_geometries or {}):
+                    geometry = geometry_change.approved_geometries[selection.parcel_entity_id]
+                elif geometry_change.operation in {"split", "merge"}:
+                    failures.append({"geometry_change_set_id": geometry_change.id,
+                                     "reason": "Split/merge requires separately selected successor baselines before publication"})
         match_ids = sorted(m.id for m in matches if m.left_feature_id in members and m.right_feature_id in members)
         review_ids = sorted(r.id for r in reviews if (r.target_type == "match" and r.target_id in match_ids) or (r.target_type == "change" and r.target_id in applied + rejected))
         source_lineage = []
@@ -110,7 +123,8 @@ def candidate_snapshot(db, project):
     context = {"policy": policy, "features": output, "exclusions": sorted(excluded, key=lambda x: x["source_feature_id"]),
                "datasets": sorted((d.id, d.content_hash, d.declared_crs, d.schema_mapping_version) for d in datasets.values()),
                "reviews": [(r.id, r.decision, r.target_revision) for r in reviews],
-               "changes": sorted((c.id, c.revision, c.status) for c in changes)}
+                "changes": sorted((c.id, c.revision, c.status) for c in changes),
+                "geometry_changes": sorted((c.id, c.revision, c.status, c.operation) for c in geometry_changes)}
     digest = hashlib.sha256(json.dumps(context, sort_keys=True, default=str).encode()).hexdigest()
     return output, excluded, failures, digest
 

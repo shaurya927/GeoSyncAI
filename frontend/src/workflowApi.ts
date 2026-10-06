@@ -1,7 +1,7 @@
 import { request } from './api'
 
 export type User = { id: string; username: string; role: string }
-export type Project = { id: string; name: string; description?: string; owner_id: string }
+export type Project = { id: string; name: string; description?: string; owner_id: string; workflow_revision?: number; validated_revision?: number }
 export type Dataset = { id: string; name: string; capture_date?: string; uploaded_at: string; source_organization?: string;
   declared_crs?: string; normalized_crs?: string; analysis_crs?: string; content_hash: string; status: string; record_count: number;
   schema_mapping_version: number; validation_report: Record<string, unknown> }
@@ -16,14 +16,19 @@ export type Evidence = { id: string; target: 'match' | 'change' | 'conflict'; re
 export type Parcel = { id: string; source_feature_ids: string[]; selection: { geometry_source_id?: string; attribute_source_id: string; attribute_sources?: Record<string,string>; revision: number; rationale: string } | null }
 export type Version = { id: string; version: number; created_at: string; lineage_manifest: Record<string, unknown> }
 export type Job = { id: string; status: string; error?: string; result?: Record<string, unknown>; job_type: string }
+export type FieldAssignment = { id: string; assignee_id: string; parcel_entity_ids: string[]; expires_at?: string; status: string; revision: number; reference_policy: Record<string, unknown> }
+export type FieldEvidence = { id: string; assignment_id: string; parcel_entity_id: string; client_event_id: string; payload: Record<string, unknown>; status: string }
 export const projectPath = (id: string) => `/projects/${id}`
 export const get = <T,>(path: string) => request<T>(path)
 export const post = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
-export async function upload(project: string, file: File, captureDate: string, source: string) {
+export async function upload(project: string, file: File, captureDate: string, source: string, metadata: { license?: string; sourceVersion?: string; namespace?: string } = {}) {
   const body = new FormData()
   body.append('file', file)
   if (captureDate) body.append('capture_date', captureDate)
   if (source) body.append('source_organization', source)
+  if (metadata.license) body.append('license_classification', metadata.license)
+  if (metadata.sourceVersion) body.append('source_version', metadata.sourceVersion)
+  if (metadata.namespace) body.append('administrative_namespace', metadata.namespace)
   return request<Dataset>(`${projectPath(project)}/datasets/upload`, { method: 'POST', body })
 }
 export async function runJob(project: string, type: string, payload: unknown, report: (job: Job) => void) {

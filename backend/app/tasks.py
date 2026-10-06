@@ -38,13 +38,26 @@ def execute_job(job_id: str) -> None:
     with SessionLocal() as db:
         try:
             claimed = db.execute(update(Job).where(Job.id == job_id, Job.status.in_(("queued", "running", "failed")))
-                                 .values(status="running", started_at=datetime.now(timezone.utc), attempts=Job.attempts + 1))
+                                 .values(status="running", stage="claimed", heartbeat_at=datetime.now(timezone.utc),
+                                         started_at=datetime.now(timezone.utc), attempts=Job.attempts + 1,
+                                         warnings=[]))
             if not claimed.rowcount:
                 db.rollback()
                 return
+            # Make truthful stage/heartbeat telemetry visible before the potentially
+            # long stage. Effects still commit atomically with succeeded status.
+            db.commit()
             job = db.get(Job, job_id)
             if job.configuration_hash != configuration_hash(db, job.job_type, job.payload):
                 raise ValueError("Job input metadata or mapping changed; submit a new job with current inputs")
+            if job.cancellation_requested:
+                job.status = "cancelled"; job.stage = "cancelled"; job.finished_at = datetime.now(timezone.utc)
+                db.commit()
+                return
+            job.stage = {"match": "matching", "topology": "topology", "change_detection": "change_detection"}.get(job.job_type, job.job_type)
+            job.progress = {"known": False, "message": "Stage running; final counts are committed with effects"}
+            job.heartbeat_at = datetime.now(timezone.utc)
+            db.commit()
             db.info["job_transaction"] = True
             payload = job.payload
             if job.job_type == "match":
@@ -58,7 +71,12 @@ def execute_job(job_id: str) -> None:
                                               payload.get("id_fields", []), payload.get("geometry_tolerance", 0.5))
             else:
                 raise ValueError(f"Unsupported job type: {job.job_type}")
+            if job.cancellation_requested:
+                raise RuntimeError("Cancellation requested before stage commit")
             job.status, job.result, job.error = "succeeded", result, None
+            job.stage = "completed"
+            job.progress = {"known": True, "result": result}
+            job.heartbeat_at = datetime.now(timezone.utc)
             job.finished_at = datetime.now(timezone.utc)
             db.commit()
         except Exception as exc:
@@ -66,8 +84,9 @@ def execute_job(job_id: str) -> None:
             # A failed receipt is persisted separately only after all stage
             # effects have been rolled back. It never reports partial success.
             db.execute(update(Job).where(Job.id == job_id, Job.status != "succeeded")
-                       .values(status="failed", error=str(exc), attempts=Job.attempts + 1,
-                               finished_at=datetime.now(timezone.utc)))
+                       .values(status="failed", stage="failed", error=str(exc),
+                               warnings=[str(exc)], heartbeat_at=datetime.now(timezone.utc),
+                                finished_at=datetime.now(timezone.utc)))
             db.commit()
 
 

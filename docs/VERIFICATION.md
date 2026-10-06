@@ -1,5 +1,33 @@
 # Verification — 2026-10-05
 
+## Additive Phase A-D implementation verification — 2026-10-06
+
+The working tree now includes migration `0005_raster_assets` and the additive
+metadata, reconciliation, geometry-review, ranker, fieldwork, query, compliance,
+citizen, OGC and raster-registry APIs. These checks were run against a fresh
+temporary SQLite database; they do not count as the historical PostGIS/Compose
+acceptance below.
+
+| Check | Actual result |
+|---|---|
+| Python compileall (`backend/app`, migrations) | Passed |
+| Focused additive workflow tests | **3 passed**, 1.06 s |
+| Baseline backend subset plus worker tests | **15 passed**, 1 skipped, 6.20 s |
+| Full backend suite in disposable pinned container | **26 passed**, 3 warnings, 14.82 s; PostGIS and real Redis/Celery duplicate-delivery path included |
+| Migration upgrade/restart through `0005_raster_assets` | **1 passed**, 3.59 s |
+| Frontend TypeScript typecheck | Passed |
+| Frontend production build | Passed; existing MapLibre chunk-size warning remains |
+| `git diff --check` | Passed |
+| Full backend suite in current system environment | **21 passed**, 2 failed because optional Fiona is not installed in that environment; 2 skipped |
+
+The focused tests cover three-source GeoJSON/CSV evidence, metadata hash guards,
+Hindi mapping terms, metric measurement, grouped supervised ranker artifacts,
+explicit field assignments, idempotent/revision-bounded field evidence,
+compliance missing-input gates, read-only query planning and OGC collection
+access. The optional Fiona failures are system-Python dependency failures; the
+pinned Docker/runtime requirements include Fiona and the full container suite
+passed.
+
 ## Executed
 
 | Check | Actual result |
@@ -10,6 +38,8 @@
 | Frontend production build | Passed; MapLibre chunk-size warning remains |
 | Python undefined/unused-name lint (`ruff --select F`) | Passed |
 | `git diff --check` | Checked after documentation updates |
+| Fresh additive Compose build/start | Passed; API, worker, PostGIS 16/PostGIS 3.4, Redis 7 and Nginx frontend healthy; Alembic reached `0005_raster_assets` |
+| Fresh Compose API smoke for additive slice | Passed; seeded demo, login, project, three uploads including CSV, reconciliation with 3 independent features, dashboard and OGC collections |
 | Full Docker Compose smoke | Passed; fresh-volume startup and service checks for PostgreSQL, Redis, API, Celery and Nginx |
 | Chromium against Compose/Nginx | Passed in 13.973 s; uploads, CRS/mapping, Celery matching, review, selection, validation, publication, all five exports, API restart and mobile-width check |
 | Separate-stack database/upload restore | Passed; browser download, publication/lineage, canonical UUID, completed job receipt and both raw uploads matched the source |

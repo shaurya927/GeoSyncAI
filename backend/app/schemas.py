@@ -25,12 +25,14 @@ class ProjectOut(BaseModel):
     name: str
     description: str | None
     owner_id: str
+    workflow_revision: int = 0
+    validated_revision: int | None = None
     created_at: datetime
 
 
 class MemberCreate(BaseModel):
     username: str
-    project_role: Literal["viewer", "member", "processor", "reviewer"] = "viewer"
+    project_role: Literal["viewer", "member", "processor", "reviewer", "steward", "field", "citizen"] = "viewer"
 
 
 class DatasetRegister(BaseModel):
@@ -41,6 +43,11 @@ class DatasetRegister(BaseModel):
     access_classification: Literal["public", "internal", "restricted"] = "internal"
     accuracy_metadata: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    administrative_namespace: dict[str, Any] = Field(default_factory=dict)
+    license_classification: str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    source_version: str | None = None
+    version_label: str | None = None
 
 
 class CRSConfirmation(BaseModel):
@@ -91,3 +98,143 @@ class ChangeRequest(BaseModel):
     id_fields: list[str] = Field(default_factory=lambda: ["parcel_id", "plot_id", "khasra_no", "survey_number"])
     geometry_tolerance: float = Field(default=0.5, ge=0)
     analysis_crs: str | None = None
+
+
+class DatasetMetadataRequest(BaseModel):
+    expected_content_hash: str | None = None
+    source_organization: str | None = None
+    capture_date: date | None = None
+    administrative_namespace: dict[str, Any] = Field(default_factory=dict)
+    license_classification: str | None = None
+    accuracy_metadata: dict[str, Any] = Field(default_factory=dict)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    source_version: str | None = None
+    version_label: str | None = None
+    access_classification: Literal["public", "internal", "restricted"] | None = None
+
+
+class MappingDictionaryRequest(BaseModel):
+    canonical_field: str = Field(min_length=1, max_length=80)
+    source_term: str = Field(min_length=1, max_length=255)
+    language: Literal["en", "hi"] = "en"
+    normalized_term: str = Field(min_length=1, max_length=255)
+    value_type: str | None = None
+    units: str | None = None
+    cardinality: Literal["single", "multi", "composite"] = "single"
+    rationale: str = Field(min_length=1, max_length=2000)
+    expected_version: int | None = Field(default=None, ge=1)
+    confirm: bool = False
+
+
+class DepartmentTemplateRequest(BaseModel):
+    department: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    administrative_namespace: dict[str, Any] = Field(default_factory=dict)
+    mapping: dict[str, Any] = Field(default_factory=dict)
+    field_descriptions: list[dict[str, Any]] = Field(default_factory=list)
+    confirm: bool = False
+
+
+class ReconciliationRequest(BaseModel):
+    source_feature_ids: list[str] = Field(min_length=3, max_length=20)
+    anchor_feature_id: str | None = None
+    rationale: str | None = Field(default=None, max_length=2000)
+
+
+class ReconciliationDecision(BaseModel):
+    decision: Literal["accepted", "rejected", "deferred"]
+    rationale: str = Field(min_length=1, max_length=2000)
+    expected_revision: int = Field(ge=1)
+    overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class GeometryChangeSetRequest(BaseModel):
+    operation: Literal["move", "split", "merge", "shared_edge"]
+    parcel_entity_ids: list[str] = Field(min_length=1, max_length=100)
+    draft_geometries: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    successor_ids: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1, max_length=2000)
+    authorization: dict[str, Any] = Field(default_factory=dict)
+
+
+class GeometryDecision(BaseModel):
+    decision: Literal["approved", "rejected", "deferred"]
+    rationale: str = Field(min_length=1, max_length=2000)
+    expected_revision: int = Field(ge=1)
+
+
+class MeasurementRequest(BaseModel):
+    geometry: dict[str, Any]
+    source_crs: str = "EPSG:4326"
+    analysis_crs: str | None = None
+    purpose: Literal["display", "analysis", "cadastral_review"] = "analysis"
+
+
+class GroundControlRequest(BaseModel):
+    dataset_id: str
+    method: Literal["translation", "similarity", "affine"] = "affine"
+    control_points: list[dict[str, Any]] = Field(min_length=2)
+
+
+class TrainingExampleRequest(BaseModel):
+    proposal_id: str | None = None
+    label: Literal[0, 1]
+    features: dict[str, float] = Field(default_factory=dict)
+    group_key: str = Field(min_length=1, max_length=255)
+    split: Literal["train", "calibration", "validation", "test"] = "train"
+    hard_negative: bool = False
+
+
+class RankerTrainRequest(BaseModel):
+    seed: int = 17
+    version: str = "ranker-v1"
+
+
+class AssignmentRequest(BaseModel):
+    assignee_id: str
+    parcel_entity_ids: list[str] = Field(min_length=1, max_length=500)
+    expires_at: datetime | None = None
+    reference_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class FieldEvidenceRequest(BaseModel):
+    parcel_entity_id: str
+    client_event_id: str = Field(min_length=1, max_length=100)
+    expected_project_revision: int = Field(ge=0)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class ComplianceRuleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    jurisdiction: str = Field(min_length=1, max_length=200)
+    category: str = Field(min_length=1, max_length=80)
+    effective_from: date | None = None
+    effective_to: date | None = None
+    inputs: list[dict[str, Any]] = Field(default_factory=list)
+    formula: dict[str, Any] = Field(default_factory=dict)
+    threshold: dict[str, Any] = Field(default_factory=dict)
+    confirm: bool = False
+
+
+class ComplianceEvaluateRequest(BaseModel):
+    parcel_entity_id: str
+    rule_id: str
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class CitizenGrantRequest(BaseModel):
+    citizen_username: str
+    parcel_entity_id: str
+    fields: list[str] = Field(min_length=1)
+    expires_at: datetime | None = None
+
+
+class CitizenCaseRequest(BaseModel):
+    parcel_entity_id: str
+    category: Literal["evidence", "discrepancy", "dispute", "status"]
+    description: str = Field(min_length=1, max_length=4000)

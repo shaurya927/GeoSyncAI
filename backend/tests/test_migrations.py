@@ -26,7 +26,7 @@ from app.models import User, Project
 from sqlalchemy import text
 with SessionLocal() as db:
     assert db.get(User,'retained').username=='retained'
-    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0003_attribute_sources'
+    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0005_raster_assets'
     assert db.execute(text('SELECT workflow_revision,validated_revision FROM projects')).all()==[]
 """
     subprocess.run([sys.executable, '-c', check], env=env, cwd=root, check=True)

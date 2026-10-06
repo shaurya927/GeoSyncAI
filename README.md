@@ -66,6 +66,8 @@ JWT secret of at least 32 characters is required. `AUTO_BOOTSTRAP` defaults off.
 | `processor` / `processor` | Upload, metadata, processing and validation |
 | `reviewer` / `reviewer` | Review and publication |
 | `admin` / `admin` | Administration and all project operations |
+| `field` / `field` | Explicitly assigned bounded fieldwork only |
+| `citizen` / `citizen` | Explicit citizen grants, permitted records and audited cases |
 
 These credentials are for an isolated demonstration. Use separate provisioned
 credentials and secrets for deployment. Global and project permissions are both
@@ -104,7 +106,8 @@ included in the repository. See [verification details](docs/VERIFICATION.md).
 ## Officer workflow
 
 1. Create/select a project. Upload GeoJSON, CSV (including attribute-only tables),
-   GeoPackage or a flat Shapefile ZIP. Supply source organization and capture date.
+   GeoPackage or a flat Shapefile ZIP. Supply source organization, capture date,
+   license/classification, source version and administrative namespace when known.
 2. Inspect the hash, quality report and records, including quarantine. Confirm
    unknown CRS using documented evidence; the UI does not guess a default CRS.
 3. Confirm field mapping, including identifier semantics and administrative
@@ -122,6 +125,21 @@ included in the repository. See [verification details](docs/VERIFICATION.md).
    Publish and inspect lineage. Unselected records appear in the exclusion report.
 8. Export GeoJSON, GeoPackage (selectable CRS), source-to-canonical CSV, quality or
    lineage. Restore a historical version by creating a new traceable version.
+
+The Dataset registry also exposes revisioned Hindi/English mapping terms and
+department templates through the API. The officer can create an explicit
+three-source reconciliation case (including attribute-only revenue evidence)
+without collapsing source membership or automatically deciding ownership.
+Approved geometry changesets retain draft/approved geometries, predecessors,
+successors, area conservation and displacement measurements. Ground-control
+sessions require paired points and independent checkpoints before approval.
+
+The Fieldwork view is an installable web/PWA shell. A field account receives only
+explicit parcel assignments, can capture a note/photo/GPS accuracy and queue one
+idempotent sync while offline. A revision conflict leaves the draft queued; it
+does not approve a boundary. Citizen accounts see only explicit permitted fields
+and may submit audited cases. Browser storage is bounded device storage, not a
+guaranteed durable evidence archive; clear it on logout/device retirement.
 
 Unmatched records can be explicitly selected as standalone baselines from their
 record preview. Split/merge candidates abstain and require field verification;
@@ -155,6 +173,9 @@ python -m pytest e2e -q
 
 npm --prefix frontend run typecheck
 npm --prefix frontend run build
+
+# Focused additive Phase A-D workflow checks:
+python -m pytest backend/tests/test_extended_workflows.py -q
 
 # Fresh output directories; answer key is kept outside application inputs:
 PYTHONPATH=backend python -m app.generate_evaluation_pack --output /tmp/geosyncai-pack --count 1000
@@ -227,4 +248,4 @@ restore a compatible backup instead.
 
 - [Architecture and invariants](docs/ARCHITECTURE.md)
 - [Backend API](backend/README.md) · [Frontend](frontend/README.md)
-- [Persistent continuation checklist](WORK_PROGRESS.md)
+- [Persistent implementation checklist](IMPLEMENTATION_CHECKLIST.md) · [Historical progress](WORK_PROGRESS.md)

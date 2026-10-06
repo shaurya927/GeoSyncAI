@@ -13,7 +13,7 @@ from .db import get_db
 from .models import Project, ProjectMember, User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
-ROLES = {"viewer", "processor", "reviewer", "admin"}
+ROLES = {"viewer", "processor", "reviewer", "steward", "field", "citizen", "admin"}
 
 
 def hash_password(password: str) -> str:
@@ -76,8 +76,8 @@ def ensure_project_access(db: Session, project_id: str, user: User, write: bool 
     if not member:
         raise HTTPException(status_code=403, detail="Project access denied")
     project_role = member.project_role
-    if review and (user.role != "reviewer" or project_role not in {"reviewer", "owner"}):
+    if review and (user.role not in {"reviewer", "steward"} or project_role not in {"reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Reviewer role required")
-    if write and (user.role not in {"processor", "reviewer"} or project_role not in {"processor", "reviewer", "owner"}):
+    if write and (user.role not in {"processor", "reviewer", "steward"} or project_role not in {"processor", "reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Write access denied")
     return project
