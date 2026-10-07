@@ -371,8 +371,8 @@ def ingest_dataset(db: Session, dataset: Dataset, data: bytes, filename: str | N
         if original_geom is not None and not original_geom.is_empty:
             try:
                 check_coordinates(original_geom)
-            except ValueError as exc:
-                coordinate_error = str(exc)
+            except ValueError:
+                coordinate_error = "Invalid source coordinates. Check geometry type, finite values and coordinate ranges."
                 original_geom = None  # exact malformed representation remains in immutable raw bytes
         geom = original_geom
         status = "processed"

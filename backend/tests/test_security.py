@@ -228,6 +228,22 @@ def test_native_parser_errors_do_not_leak_in_api_or_retained_reports(client, aut
     assert datasets.json()[0]['status'] == 'rejected'
 
 
+def test_native_coordinate_errors_are_safe_quarantine_reasons(client, auth_token, monkeypatch):
+    from app import services
+    private_detail = '/private/native-library/coordinate-stack: sensitive implementation'
+    def broken_coordinates(*args): raise ValueError(private_detail)
+    monkeypatch.setattr(services, 'check_coordinates', broken_coordinates)
+    headers = {'Authorization': 'Bearer ' + auth_token('admin')}
+    project = client.post('/api/projects', headers=headers, json={'name': 'Coordinate redaction regression'}).json()['id']
+    body = json.dumps({'type': 'FeatureCollection', 'features': [{'type': 'Feature', 'properties': {},
+                       'geometry': {'type': 'Point', 'coordinates': [73, 20]}}]}).encode()
+    response = client.post(f'/api/projects/{project}/datasets/upload', headers=headers,
+                           files={'file': ('coordinates.geojson', body, 'application/geo+json')},
+                           data={'declared_crs': 'EPSG:4326'})
+    assert response.status_code == 201 and private_detail not in response.text
+    assert response.json()['validation_report']['quarantined'] == 1
+
+
 def test_redis_shared_atomic_budget():
     url=os.environ.get('BROKER_TEST_URL')
     if not url: pytest.skip('Redis service required for cross-worker atomic traffic test')
