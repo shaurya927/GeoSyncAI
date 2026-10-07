@@ -24,6 +24,7 @@
 .json-preview { white-space:pre-wrap; overflow-wrap:anywhere; max-height:400px; overflow:auto; background:#f6f8f5; padding:14px; font-size:11px; }
 .hash { overflow-wrap:anywhere; }
 .source-row { display:flex; align-items:center; gap:15px; padding:12px 0; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+.raster-preview { display:block; max-width:260px; max-height:180px; border:1px solid var(--line); border-radius:6px; background:#eef3ef; }
 .evidence-workspace { display:grid; grid-template-columns:minmax(180px,.5fr) minmax(0,1.5fr); gap:18px; }
 .evidence-list { max-height:700px; overflow:auto; }
 .evidence-list button { display:flex; width:100%; justify-content:space-between; gap:10px; padding:14px; border-bottom:1px solid var(--line); text-align:left; }

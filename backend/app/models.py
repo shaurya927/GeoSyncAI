@@ -410,6 +410,9 @@ class ModelArtifact(Base):
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     dataset_fingerprint: Mapped[str] = mapped_column(String(64))
     seed: Mapped[int] = mapped_column(Integer, default=0)
+    activation_status: Mapped[str] = mapped_column(String(20), default="inactive")
+    activated_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -484,6 +487,7 @@ class CitizenGrant(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     citizen_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     parcel_entity_id: Mapped[str] = mapped_column(ForeignKey("parcel_entities.id"), index=True)
+    published_version_id: Mapped[str | None] = mapped_column(ForeignKey("published_versions.id"), nullable=True, index=True)
     fields: Mapped[list[str]] = mapped_column(JSON, default=list)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="active")

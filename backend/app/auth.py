@@ -66,7 +66,23 @@ def require_roles(*roles: str):
     return dependency
 
 
-LIMITED_ROLES = {"field", "citizen"}
+CAPABILITY_ROLES = {
+    "project": {"viewer", "processor", "reviewer", "steward", "field", "citizen", "admin"},
+    "departmental": {"viewer", "processor", "reviewer", "steward", "admin"},
+    "fieldwork": {"field", "processor", "reviewer", "steward", "admin"},
+    "citizen": {"citizen", "reviewer", "steward", "admin"},
+}
+PROJECT_CAPABILITY_ROLES = {
+    "project": {"viewer", "member", "processor", "reviewer", "steward", "field", "citizen", "owner"},
+    "departmental": {"viewer", "member", "processor", "reviewer", "steward", "owner"},
+    "fieldwork": {"field", "processor", "reviewer", "steward", "owner"},
+    "citizen": {"citizen", "reviewer", "steward", "owner"},
+}
+
+
+def capability_allowed(user: User, member: ProjectMember | None, capability: str) -> bool:
+    return user.role == "admin" or bool(member and user.role in CAPABILITY_ROLES.get(capability, set())
+                                        and member.project_role in PROJECT_CAPABILITY_ROLES.get(capability, set()))
 
 
 def project_member(db: Session, project_id: str, user_id: str) -> ProjectMember | None:
@@ -84,14 +100,23 @@ def ensure_project_access(db: Session, project_id: str, user: User, write: bool 
     member = project_member(db, project_id, user.id)
     if not member:
         raise HTTPException(status_code=403, detail="Project access denied")
-    if user.role in LIMITED_ROLES and capability not in {"project", "fieldwork", "citizen"}:
-        raise HTTPException(status_code=403, detail="This account has no departmental data-read capability")
+    allowed_roles = CAPABILITY_ROLES.get(capability)
+    if allowed_roles is None:
+        raise HTTPException(status_code=500, detail=f"Unknown access capability: {capability}")
+    if not capability_allowed(user, member, capability):
+        raise HTTPException(status_code=403, detail=f"This account has no {capability} capability")
     project_role = member.project_role
     if review and (user.role not in {"reviewer", "steward"} or project_role not in {"reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Reviewer role required")
     if write and (user.role not in {"processor", "reviewer", "steward"} or project_role not in {"processor", "reviewer", "steward", "owner"}):
         raise HTTPException(status_code=403, detail="Write access denied")
     return project
+
+
+def ensure_classification_access(db: Session, project_id: str, user: User, classification: str) -> None:
+    ensure_project_access(db, project_id, user)
+    if classification == "restricted":
+        ensure_project_access(db, project_id, user, review=True)
 
 
 def ensure_project_membership(db: Session, project_id: str, user: User) -> Project:

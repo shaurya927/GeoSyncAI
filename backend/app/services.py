@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import tempfile
 import zipfile
 from datetime import date
@@ -21,7 +22,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .policy import processing_policy
 from .spatial import check_coordinates, reproject, transformation_metadata
-from .models import (AuditEvent, ChangeProposal, Dataset, MatchProposal, ParcelEntity,
+from .models import (AuditEvent, ChangeProposal, Dataset, MatchProposal, ModelArtifact, ParcelEntity,
                      ParcelSourceLink, Project, PublishedVersion, SourceFeature, TopologyConflict, uid, utcnow)
 
 
@@ -633,6 +634,13 @@ def run_matching(db: Session, project_id: str, left_dataset_id: str, right_datas
     right_tree = STRtree([geometry for _, geometry in right_spatial]) if right_spatial and spatial_enabled else None
     result = {"matched": 0, "unmatched_left": 0, "ambiguous": 0,
               "spatial_evidence_used": spatial_enabled, "proposals": []}
+    active_model = db.scalar(select(ModelArtifact).where(ModelArtifact.project_id == project_id,
+                                                         ModelArtifact.model_type == "supervised_logistic_ranker",
+                                                         ModelArtifact.activation_status == "active")
+                             .order_by(ModelArtifact.created_at.desc()))
+    if active_model:
+        result["ranking_model"] = {"version": active_model.version, "score_type": "uncalibrated_model_score",
+                                    "probability_claim": False, "dataset_fingerprint": active_model.dataset_fingerprint}
     proposals_by_right: dict[str, list[tuple[MatchProposal, dict[str, Any]]]] = {}
     for lf in left:
         candidates: list[tuple[float, SourceFeature, dict[str, Any]]] = []
@@ -644,6 +652,21 @@ def run_matching(db: Session, project_id: str, left_dataset_id: str, right_datas
             candidate_right = right if not spatial_enabled else []
         for rf in candidate_right:
             score, evidence = score_pair(lf, rf, id_fields, max_distance, spatial_enabled, namespace_fields, analysis_crs)
+            if active_model:
+                artifact = active_model.artifact or {}
+                fields = artifact.get("fields", [])
+                weights = artifact.get("weights", [])
+                bias = float(artifact.get("bias", 0.0))
+                vector = {"score": float(evidence.get("score", 0.0)),
+                          "identifier_agreement": float(bool(evidence.get("identifier_agreement"))),
+                          "iou": float(evidence.get("intersection_over_union", 0.0) or 0.0),
+                          "distance_inverse": 1.0 / (1.0 + float(evidence.get("centroid_distance_m") or 100000.0)),
+                          "namespace_compatible": float(bool(evidence.get("namespace_compatible", True)))}
+                logits = bias + sum(float(weight) * float(vector.get(field, 0.0)) for field, weight in zip(fields, weights))
+                model_score = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, logits))))
+                evidence["deterministic_score"] = score
+                evidence["learned_score"] = round(model_score, 6)
+                score = round(model_score, 6)
             if namespace_fields:
                 if not evidence["namespace_compatible"]:
                     continue
@@ -683,7 +706,9 @@ def run_matching(db: Session, project_id: str, left_dataset_id: str, right_datas
         evidence["ambiguity_margin"] = ambiguity_margin
         evidence["possible_split_merge"] = possible_split
         proposal = MatchProposal(id=uid(), project_id=project_id, left_feature_id=lf.id, right_feature_id=best[1].id,
-                                 score=best[0], status=status, candidate_rank=1, evidence=evidence)
+                                 score=best[0], score_type="uncalibrated_model_score" if active_model else "uncalibrated_rule_score",
+                                 model_version=active_model.version if active_model else "rules-v2",
+                                 status=status, candidate_rank=1, evidence=evidence)
         db.add(proposal)
         result["proposals"].append({"id": proposal.id, "left_feature_id": lf.id, "right_feature_id": best[1].id,
                                      "status": status, "score": best[0], "evidence": evidence})

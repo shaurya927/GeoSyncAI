@@ -5,7 +5,7 @@ import sys
 
 
 def test_original_schema_upgrade_and_restart_preserve_data(tmp_path):
-    root = Path(__file__).resolve().parents[2]
+    root = next((candidate for candidate in Path(__file__).resolve().parents if (candidate / 'alembic.ini').exists()), Path.cwd())
     database = tmp_path / 'legacy.db'
     env = {**os.environ, 'DATABASE_URL': f'sqlite:///{database}', 'PYTHONPATH': str(root / 'backend') + os.pathsep + str(root)}
     original = """
@@ -26,7 +26,7 @@ from app.models import User, Project
 from sqlalchemy import text
 with SessionLocal() as db:
     assert db.get(User,'retained').username=='retained'
-    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0006_integrity_access_leases'
+    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0008_ranker_activation'
     assert db.execute(text('SELECT workflow_revision,validated_revision FROM projects')).all()==[]
 """
     subprocess.run([sys.executable, '-c', check], env=env, cwd=root, check=True)

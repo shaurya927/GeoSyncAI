@@ -1,4 +1,34 @@
-# Verification — 2026-10-05
+# Verification history
+
+## Submission revision verification — 2026-10-07
+
+This section is the current evidence for the local uncommitted submission work.
+The historical sections below are retained for traceability and are not current
+acceptance evidence. Existing user databases/uploads were not used as fixtures.
+
+| Check | Result |
+|---|---|
+| System Python backend suite | **33 passed, 2 failed, 3 skipped**; Fiona failures and genuine raster fixture skip are dependency-bound to Python 3.14 |
+| Focused local defect/workflow suite | **15 passed, 1 skipped**; system rasterio skip |
+| Pinned PostGIS/Redis/Celery Compose suite through migration 0008 | **38 passed, 0 skipped** |
+| Python compileall | Passed |
+| Ruff F-only lint | Passed |
+| Frontend typecheck/build | Passed; existing Vite large-chunk warning |
+| `git diff --check` | Passed |
+| Production Nginx Chromium smoke | Passed admin login/new views/page errors/390px responsive width; `e2e/test_production_workflow.mjs` also passed upload → publish → export → refresh with one feature and two lineage sources |
+| 1,000-parcel synthetic benchmark | Passed in **10.8792 s**; metrics and denominators recorded in `docs/FINAL_ACCEPTANCE.md` |
+
+The Compose project was `geosyncai-final-20261007`, with disposable PostGIS,
+Redis, API, worker, frontend and volumes. The full backend run included real
+Celery delivery and genuine rasterio/Fiona GeoTIFF checks. Production Chromium
+used `mcr.microsoft.com/playwright:v1.63.0-noble` against Nginx port 5173.
+The API was restarted before a repeat Nginx/Chromium smoke, which passed. The
+separate database/upload restore probe passed after this revision: restored
+health, frontend, project/version IDs, exported GeoJSON SHA-256, and raw-upload
+SHA-256 matched the source. The complete field offline browser matrix remains
+open.
+
+# Verification — historical 2026-10-05
 
 ## Defect-fix verification — 2026-10-06
 

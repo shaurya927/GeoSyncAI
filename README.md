@@ -103,13 +103,16 @@ job receipt and raw upload bytes matched. Fresh-volume startup required a TCP
 PostgreSQL health probe; Fiona in the slim image required `libexpat1`. Both are
 included in the repository. See [verification details](docs/VERIFICATION.md).
 
-**Defect-fix verification:** On 2026-10-06, a fresh disposable Compose project
-was rebuilt through migration `0006_integrity_access_leases`; PostGIS, Redis,
-the API, Celery worker and Nginx frontend reached healthy/ready states. The
-Postgres-container regression run passed 32 tests with one existing skip and
-one migration subprocess test deselected because its copied test path cannot
-see the repository-level migration package. The full current verification log
-records the system-Python Fiona limitation and remaining browser/restore work.
+**Defect-fix verification:** On 2026-10-07, a fresh disposable Compose project
+was rebuilt through migration `0008_ranker_activation`; PostGIS, Redis, the API,
+Celery worker and Nginx frontend reached healthy/ready states. The
+Postgres-container regression run passed 38 tests with no skips, including the
+real Celery worker and genuine GeoTIFF metadata/preview checks. Production-built
+frontend smoke and the upload → publish → export → refresh workflow passed
+through Nginx/Chromium. A separate database/raw-upload restore then matched
+project/version IDs, exported GeoJSON SHA-256, and raw-upload SHA-256. The full
+verification log records the system-Python Fiona limitation and remaining field
+offline browser matrix.
 
 ## Officer workflow
 
@@ -137,10 +140,14 @@ records the system-Python Fiona limitation and remaining browser/restore work.
 The Dataset registry also exposes revisioned Hindi/English mapping terms and
 department templates through the API. The officer can create an explicit
 three-source reconciliation case (including attribute-only revenue evidence)
-without collapsing source membership or automatically deciding ownership.
+and, when the reviewer supplies explicit evidenced source selections, materialize
+canonical membership without collapsing competing claims or automatically
+deciding ownership.
 Approved geometry changesets retain draft/approved geometries, predecessors,
 successors, area conservation and displacement measurements. Ground-control
 sessions require paired points and independent checkpoints before approval.
+The Boundary editor provides bounded move/split/merge/shared-edge drafts,
+undo/cancel, before/after preview and server-authoritative approval gates.
 
 The Fieldwork view is an installable web/PWA shell. A field account receives only
 explicit parcel assignments, can capture a note/photo/GPS accuracy and queue one
@@ -148,6 +155,9 @@ idempotent sync while offline. A revision conflict leaves the draft queued; it
 does not approve a boundary. Citizen accounts see only explicit permitted fields
 and may submit audited cases. Browser storage is bounded device storage, not a
 guaranteed durable evidence archive; clear it on logout/device retirement.
+Reviewer/admin panels manage assignment expiry/revocation, frozen citizen grants,
+and case responses. Citizen records resolve from the grant's frozen published
+version rather than current working selections.
 
 Unmatched records can be explicitly selected as standalone baselines from their
 record preview. Split/merge candidates abstain and require field verification;
@@ -172,6 +182,9 @@ review. The exact browser acceptance demonstration is automated in `e2e/test_bro
 python -m pytest backend/tests -q
 python -m playwright install --with-deps chromium
 python -m pytest e2e -q
+
+# Production-built Compose/Nginx Chromium smoke (with the disposable stack running)
+BASE_URL=http://127.0.0.1:5173 python -m pytest e2e/test_production_compose.py -q
 
 # Dedicated disposable PostGIS database and Redis broker:
 TEST_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST/TEST_DB \

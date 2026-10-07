@@ -1,5 +1,6 @@
 import json
 import uuid
+import pytest
 
 
 def auth(value):
@@ -53,11 +54,28 @@ def test_source_registry_three_source_reconciliation_and_measurement(client, aut
     assert controls.status_code == 200, controls.text
     approved = client.post(f"/api/projects/{project_id}/ground-control/{controls.json()['id']}/approve", headers=auth(admin))
     assert approved.status_code == 200 and approved.json()["status"] == "approved"
+
+
+def test_genuine_geotiff_metadata_preview_and_integrity(client, auth_token):
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.io import MemoryFile
+    from rasterio.transform import from_origin
+    admin = auth_token("admin")
+    project_id = client.post("/api/projects", headers=auth(admin), json={"name": f"raster-{uuid.uuid4()}"}).json()["id"]
+    with MemoryFile() as memory:
+        with memory.open(driver="GTiff", height=2, width=2, count=1, dtype="uint8", crs="EPSG:4326",
+                         transform=from_origin(73, 20.002, 0.001, 0.001)) as dataset:
+            import numpy as np
+            dataset.write(np.array([[1, 2], [3, 4]], dtype="uint8"), 1)
+        payload = memory.read()
     raster = client.post(f"/api/projects/{project_id}/raster-assets", headers=auth(admin),
-                         files={"file": ("reference.tif", b"II*\x00demo", "image/tiff")}, data={"attribution": "Demo source"})
+                         files={"file": ("reference.tif", payload, "image/tiff")}, data={"attribution": "Demo source"})
     assert raster.status_code == 201, raster.text
+    assert raster.json()["metadata"]["width"] == 2 and raster.json()["metadata"]["crs"] == "EPSG:4326"
+    preview = client.get(f"/api/projects/{project_id}/raster-assets/{raster.json()['id']}/preview", headers=auth(admin))
+    assert preview.status_code == 200 and preview.headers["content-type"].startswith("image/png")
     raster_bytes = client.get(f"/api/projects/{project_id}/raster-assets/{raster.json()['id']}/bytes", headers=auth(admin))
-    assert raster_bytes.status_code == 200 and raster_bytes.content == b"II*\x00demo"
+    assert raster_bytes.status_code == 200 and raster_bytes.content == payload
 
 
 def test_grouped_supervised_ranker_rejects_leakage_and_reports_calibration(client, auth_token):
@@ -71,6 +89,8 @@ def test_grouped_supervised_ranker_rejects_leakage_and_reports_calibration(clien
     trained = client.post(f"/api/projects/{project_id}/ranker/train", headers=auth(admin), json={"seed": 9, "version": "test-v1"})
     assert trained.status_code == 200, trained.text
     assert trained.json()["metrics"]["splits"]["validation"]["count"] == 1
+    activated = client.post(f"/api/projects/{project_id}/ranker/{trained.json()['id']}/activation", headers=auth(admin), json={"active": True})
+    assert activated.status_code == 200 and activated.json()["activation_status"] == "active"
 
 
 def test_ranker_fieldwork_compliance_query_and_ogc_are_scoped(client, auth_token):

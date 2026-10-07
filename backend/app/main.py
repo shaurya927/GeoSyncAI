@@ -4,6 +4,8 @@ import csv
 import hashlib
 import io
 import json
+import struct
+import zlib
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -15,30 +17,31 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from shapely.geometry import shape
 
 from .auth import (CurrentUser, ensure_project_access, ensure_project_membership, hash_password, verify_password,
-                   create_access_token, project_member, utc_expired)
+                   create_access_token, project_member, utc_expired, capability_allowed)
 from .config import get_settings
 from .db import get_db, init_db
 from .models import (Dataset, Job, MatchProposal, Project, ProjectMember, ReviewDecision, SourceFeature,
                      TopologyConflict, User, ChangeProposal, PublishedVersion, PublicationFeature, SchemaMapping,
                      ParcelEntity, ParcelSourceLink, ParcelSelection, MappingDictionaryEntry, DepartmentTemplate,
                      ReconciliationCase, GeometryChangeSet, GroundControlSession, TrainingExample, ModelArtifact,
-                     FieldAssignment, FieldEvidence, ComplianceRule, CitizenGrant, CitizenCase, AuditEvent, RasterAsset, uid)
+                     FieldAssignment, FieldEvidence, ComplianceRule, CitizenGrant, CitizenCase, RasterAsset, uid, AuditEvent)
 from .schemas import (CRSConfirmation, ChangeRequest, DatasetRegister, LoginRequest, MatchRequest, MemberCreate,
                        ProjectCreate, ProjectOut, ReviewRequest, SchemaMappingRequest, SelectionRequest, PolicyRequest, Token,
                        DatasetMetadataRequest, MappingDictionaryRequest, DepartmentTemplateRequest, ReconciliationRequest,
                        ReconciliationDecision, GeometryChangeSetRequest, GeometryDecision, MeasurementRequest,
-                       GroundControlRequest, GroundControlApprovalRequest, TrainingExampleRequest, RankerTrainRequest, AssignmentRequest,
+                        GroundControlRequest, GroundControlApprovalRequest, TrainingExampleRequest, RankerTrainRequest, RankerActivationRequest, AssignmentRequest, AssignmentUpdateRequest,
                        FieldEvidenceRequest, FieldEvidenceResolutionRequest, QueryRequest, ComplianceRuleRequest, ComplianceEvaluateRequest,
-                       CitizenGrantRequest, CitizenCaseRequest)
+                        CitizenGrantRequest, CitizenGrantUpdateRequest, CitizenCaseRequest, CitizenCaseResponseRequest)
 from .services import (audit, bootstrap_synthetic, confirm_dataset_crs, ingest_dataset, materialize_identity_link,
                        run_change_detection, run_matching, run_topology, administrative_context, touch_project, next_version,
                        invalidate_dataset_evidence)
-from .publication import canonical_sha256, publish, validate_project
+from .publication import canonical_output_context, canonical_sha256, publish, validate_project
 from .policy import processing_policy
 from .tasks import dispatch_job, recover_jobs, configuration_hash as job_configuration_hash
-from .advanced import (build_reconciliation, compliance_result, geometry_measurements, validate_compliance_rule,
+from .advanced import (build_reconciliation, compliance_result, geometry_measurements, resolve_canonical_geometry, validate_compliance_rule,
                        fit_control_points, measure_geometry, parse_structured_query, train_ranker)
 
 
@@ -130,14 +133,16 @@ def capabilities(project_id: str, db: Db, user: CurrentUser):
     project = ensure_project_membership(db, project_id, user)
     member = project_member(db, project_id, user.id)
     role = user.role
-    departmental = role in {"admin", "processor", "reviewer", "steward", "viewer"}
+    departmental = capability_allowed(user, member, "departmental")
+    process = departmental and (role == "admin" or (role in {"processor", "reviewer", "steward"}
+                   and member and member.project_role in {"processor", "reviewer", "steward", "owner"}))
+    review = departmental and (role == "admin" or (role in {"reviewer", "steward"}
+                   and member and member.project_role in {"reviewer", "steward", "owner"}))
     return {"project_id": project.id, "role": role, "project_role": member.project_role if member else "admin",
             "read_project": True, "read_departmental": departmental,
-            "process": role in {"admin", "processor", "reviewer", "steward"},
-            "review": role in {"admin", "reviewer", "steward"},
-            "publish": role in {"admin", "reviewer", "steward"},
-            "fieldwork": role in {"admin", "field", "processor", "reviewer", "steward"},
-            "citizen_records": role == "citizen", "exports": departmental}
+            "process": bool(process), "review": bool(review), "publish": bool(review),
+            "fieldwork": capability_allowed(user, member, "fieldwork"),
+            "citizen_records": capability_allowed(user, member, "citizen"), "exports": departmental}
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
@@ -197,7 +202,6 @@ def save_policy(project_id: str, payload: PolicyRequest, db: Db, user: CurrentUs
 
 @app.get("/api/projects/{project_id}/history")
 def project_history(project_id: str, db: Db, user: CurrentUser):
-    from .models import AuditEvent
     ensure_project_access(db, project_id, user)
     return [{'id':e.id, 'action':e.action, 'actor_id':e.actor_id, 'timestamp':e.created_at, 'details':e.details}
             for e in db.scalars(select(AuditEvent).where(AuditEvent.project_id == project_id).order_by(AuditEvent.created_at.desc()).limit(100))]
@@ -249,6 +253,15 @@ def add_member(project_id: str, payload: MemberCreate, db: Db, user: CurrentUser
     return {"project_id": project_id, "username": target.username, "project_role": member.project_role}
 
 
+@app.get("/api/projects/{project_id}/members")
+def list_members(project_id: str, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True)
+    rows = db.execute(select(User, ProjectMember.project_role).join(ProjectMember, ProjectMember.user_id == User.id)
+                      .where(ProjectMember.project_id == project_id).order_by(User.username)).all()
+    return [{"id": target.id, "username": target.username, "role": target.role, "project_role": project_role}
+            for target, project_role in rows]
+
+
 @app.post("/api/projects/{project_id}/datasets", status_code=201)
 def register_dataset(project_id: str, payload: DatasetRegister, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
@@ -273,9 +286,10 @@ def register_dataset(project_id: str, payload: DatasetRegister, db: Db, user: Cu
 async def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: UploadFile = File(...),
                          name: str | None = Form(None), source_organization: str | None = Form(None),
                          capture_date: date | None = Form(None), declared_crs: str | None = Form(None),
-                         parent_dataset_id: str | None = Form(None), license_classification: str | None = Form(None),
-                         source_version: str | None = Form(None), version_label: str | None = Form(None),
-                         administrative_namespace: str | None = Form(None)):
+                          parent_dataset_id: str | None = Form(None), license_classification: str | None = Form(None),
+                          source_version: str | None = Form(None), version_label: str | None = Form(None),
+                          administrative_namespace: str | None = Form(None), access_classification: str = Form("internal"),
+                          accuracy_metadata: str | None = Form(None), provenance: str | None = Form(None)):
     ensure_project_access(db, project_id, user, write=True)
     data = await file.read(get_settings().max_upload_bytes + 1)
     if len(data) > get_settings().max_upload_bytes:
@@ -288,11 +302,21 @@ async def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: Uploa
                 raise ValueError("Administrative namespace must be a JSON object")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(422, "Administrative namespace must be valid JSON") from exc
+    if access_classification not in {"public", "internal", "restricted"}:
+        raise HTTPException(422, "Invalid source access classification")
+    try:
+        accuracy = json.loads(accuracy_metadata) if accuracy_metadata else {}
+        source_provenance = json.loads(provenance) if provenance else {}
+        if not isinstance(accuracy, dict) or not isinstance(source_provenance, dict):
+            raise ValueError
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Accuracy metadata and provenance must be JSON objects") from exc
     dataset = Dataset(project_id=project_id, name=name or file.filename or "uploaded dataset",
                       source_organization=source_organization, capture_date=capture_date, declared_crs=declared_crs,
                       parent_dataset_id=parent_dataset_id, license_classification=license_classification,
                       source_version=source_version, version_label=version_label,
-                      administrative_namespace=namespace)
+                      administrative_namespace=namespace, access_classification=access_classification,
+                      accuracy_metadata=accuracy, provenance=source_provenance)
     if parent_dataset_id:
         validate_dataset(db, project_id, parent_dataset_id)
     db.add(dataset)
@@ -363,9 +387,32 @@ async def upload_raster_asset(project_id: str, db: Db, user: CurrentUser, file: 
         raise HTTPException(413, "Raster exceeds the configured upload limit")
     if data[:4] not in {b"II*\x00", b"MM\x00*"}:
         raise HTTPException(422, "Raster inspection accepts GeoTIFF/COG bytes only")
+    try:
+        from rasterio.io import MemoryFile
+        with MemoryFile(data) as memory:
+            with memory.open() as source:
+                if source.driver not in {"GTiff", "COG"}:
+                    raise ValueError("Raster must be a GeoTIFF or Cloud Optimized GeoTIFF")
+                actual_crs = source.crs.to_string() if source.crs else None
+                if actual_crs and source_crs and actual_crs != source_crs:
+                    raise ValueError("Supplied raster CRS does not match GeoTIFF CRS metadata")
+                resolved_crs = actual_crs or source_crs
+                metadata = {"driver": source.driver, "width": source.width, "height": source.height,
+                            "count": source.count, "dtype": list(source.dtypes), "nodata": source.nodata,
+                            "transform": list(source.transform), "bounds": [source.bounds.left, source.bounds.bottom,
+                                                                             source.bounds.right, source.bounds.top],
+                            "resolution": list(source.res), "crs": resolved_crs,
+                            "crs_from_file": bool(actual_crs), "inspection": "rasterio_geotiff_metadata"}
+                raster_bounds = list(metadata["bounds"])
+    except ImportError as exc:
+        raise HTTPException(503, "GeoTIFF inspection requires the pinned rasterio runtime") from exc
+    except Exception as exc:
+        raise HTTPException(422, f"Invalid GeoTIFF: {exc}") from exc
     asset = RasterAsset(project_id=project_id, name=name or file.filename or "raster.tif", content_hash=hashlib.sha256(data).hexdigest(),
-                        source_crs=source_crs, attribution=attribution, access_classification=access_classification,
-                        source_date=source_date, metadata_json={"bytes": len(data), "inspection": "header-only; CRS/bounds must be supplied or inspected by configured GDAL service"},
+                        source_crs=resolved_crs, bounds=raster_bounds, mime_type=file.content_type or "image/tiff",
+                        attribution=attribution, access_classification=access_classification,
+                        source_date=source_date, metadata_json={**metadata, "bytes": len(data)},
+                        status="registered" if resolved_crs else "needs_crs_review",
                         created_by=user.id)
     asset.id = uid()
     raw_path = get_settings().storage_path / f"{asset.id}-{Path(file.filename or 'raster.tif').name.replace('..', '_')}"
@@ -398,7 +445,55 @@ def download_raster_asset(project_id: str, asset_id: str, db: Db, user: CurrentU
         raise HTTPException(409, "Raster integrity verification failed")
     return StreamingResponse(open(path, "rb"), media_type=asset.mime_type,
                              headers={"Content-Disposition": f'attachment; filename="{asset.name}"',
-                                      "X-GeoSyncAI-Attribution": asset.attribution or ""})
+                                       "X-GeoSyncAI-Attribution": asset.attribution or ""})
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff)
+
+
+def _raster_png(path: str) -> bytes:
+    import numpy as np
+    import rasterio
+    with rasterio.open(path) as source:
+        width, height = min(source.width, 512), min(source.height, 512)
+        count = min(source.count, 3)
+        values = source.read(indexes=list(range(1, count + 1)), out_shape=(count, height, width), masked=True).filled(0).astype("float64")
+    if count == 1:
+        low, high = float(np.nanmin(values)), float(np.nanmax(values))
+        scale = 255.0 / (high - low) if high > low else 1.0
+        pixels = np.clip((values[0] - low) * scale, 0, 255).astype("uint8")
+        color_type, rows = 0, b"".join(b"\x00" + row.tobytes() for row in pixels)
+    else:
+        low, high = float(np.nanmin(values)), float(np.nanmax(values))
+        scale = 255.0 / (high - low) if high > low else 1.0
+        pixels = np.clip((values - low) * scale, 0, 255).astype("uint8").transpose(1, 2, 0)
+        color_type, rows = 2, b"".join(b"\x00" + row.tobytes() for row in pixels)
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header) + _png_chunk(b"IDAT", zlib.compress(rows)) + _png_chunk(b"IEND", b"")
+
+
+@app.get("/api/projects/{project_id}/raster-assets/{asset_id}/preview")
+def preview_raster_asset(project_id: str, asset_id: str, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user)
+    asset = db.get(RasterAsset, asset_id)
+    if not asset or asset.project_id != project_id:
+        raise HTTPException(404, "Raster asset not found")
+    if asset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+        raise HTTPException(403, "Restricted raster requires steward or reviewer permission")
+    if not asset.source_crs:
+        raise HTTPException(409, "Raster CRS is unresolved; preview is blocked until it is confirmed")
+    path = Path(asset.raw_path)
+    if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != asset.content_hash:
+        raise HTTPException(409, "Raster integrity verification failed")
+    try:
+        return StreamingResponse(iter([_raster_png(str(path))]), media_type="image/png",
+                                 headers={"X-GeoSyncAI-Source-CRS": asset.source_crs,
+                                          "X-GeoSyncAI-Bounds": json.dumps(asset.bounds or [])})
+    except ImportError as exc:
+        raise HTTPException(503, "Raster preview requires the pinned rasterio runtime") from exc
+    except Exception as exc:
+        raise HTTPException(422, f"Raster preview failed: {exc}") from exc
 
 
 def raster_response(asset: RasterAsset) -> dict:
@@ -664,17 +759,63 @@ def list_reconciliations(project_id: str, db: Db, user: CurrentUser):
 @app.post("/api/projects/{project_id}/reconciliations/{case_id}/decision")
 def decide_reconciliation(project_id: str, case_id: str, payload: ReconciliationDecision, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True, review=True)
+    db.execute(update(Project).where(Project.id == project_id).values(workflow_revision=Project.workflow_revision))
     case = db.get(ReconciliationCase, case_id)
     if not case or case.project_id != project_id:
         raise HTTPException(404, "Reconciliation case not found")
     if case.revision != payload.expected_revision or case.status in {"accepted", "rejected"}:
         raise HTTPException(409, "Reconciliation case is stale or final")
+    if payload.overrides:
+        raise HTTPException(422, "Choose evidenced per-field sources; arbitrary value invention is not supported")
+    if payload.decision == "accepted":
+        sources = [db.get(SourceFeature, source_id) for source_id in case.source_feature_ids]
+        for source in sources:
+            if not source or db.get(Dataset, source.dataset_id).project_id != project_id or source.status != "processed":
+                raise HTTPException(409, "Reconciliation references an unavailable project source")
+        active_links = list(db.scalars(select(ParcelSourceLink).join(ParcelEntity,
+                    ParcelEntity.id == ParcelSourceLink.parcel_entity_id).where(
+                    ParcelSourceLink.project_id == project_id,
+                    ParcelSourceLink.source_feature_id.in_(case.source_feature_ids), ParcelEntity.status == "active")))
+        existing_entities = {link.parcel_entity_id for link in active_links}
+        if len(existing_entities) > 1:
+            raise HTTPException(409, "Sources already belong to different active parcels; explicit grouped identity review is required")
+        if existing_entities:
+            entity = db.get(ParcelEntity, next(iter(existing_entities)))
+            current_sources = set(db.scalars(select(ParcelSourceLink.source_feature_id).where(ParcelSourceLink.parcel_entity_id == entity.id)))
+            if current_sources - set(case.source_feature_ids):
+                raise HTTPException(409, "Case omits existing identity evidence; include it before extending membership")
+        else:
+            entity = ParcelEntity(project_id=project_id)
+            db.add(entity); db.flush()
+        linked = {link.source_feature_id for link in active_links}
+        for source_id in case.source_feature_ids:
+            if source_id not in linked:
+                db.add(ParcelSourceLink(project_id=project_id, parcel_entity_id=entity.id,
+                                       source_feature_id=source_id, link_status="reconciliation"))
+        if payload.approve_selection:
+            if payload.attribute_source_id not in case.source_feature_ids or (payload.geometry_source_id
+                            and payload.geometry_source_id not in case.source_feature_ids):
+                raise HTTPException(422, "Explicit selections must reference this case's evidenced sources")
+            if not set(payload.attribute_sources.values()).issubset(set(case.source_feature_ids)):
+                raise HTTPException(422, "Per-field choices must reference this case's sources")
+            geometry_source = db.get(SourceFeature, payload.geometry_source_id) if payload.geometry_source_id else None
+            if geometry_source and not geometry_source.normalized_geometry:
+                raise HTTPException(409, "Selected boundary source has no reviewed CRS/geometry")
+            selection = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == entity.id))
+            if selection:
+                raise HTTPException(409, "Parcel already has a reviewed selection; change it through revisioned selection review")
+            db.add(ParcelSelection(parcel_entity_id=entity.id, geometry_source_id=payload.geometry_source_id,
+                                   attribute_source_id=payload.attribute_source_id, attribute_sources=payload.attribute_sources,
+                                   actor_id=user.id, rationale=payload.rationale))
+        case.recommendation = {**case.recommendation, "canonical_parcel_id": entity.id,
+                                "selection_explicitly_approved": payload.approve_selection}
     case.status = payload.decision
     case.rationale = payload.rationale
     case.recommendation = {**case.recommendation, "authorized_overrides": payload.overrides}
     case.revision += 1
     audit(db, "reconciliation_decision", user.id, project_id, "reconciliation", case.id,
           {"decision": payload.decision, "overrides": payload.overrides})
+    touch_project(db, project_id)
     db.commit()
     return reconciliation_response(case)
 
@@ -688,11 +829,14 @@ def reconciliation_response(case: ReconciliationCase) -> dict:
 @app.post("/api/projects/{project_id}/geometry-changes")
 def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
+    db.execute(update(Project).where(Project.id == project_id).values(workflow_revision=Project.workflow_revision))
     entities = list(db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id,
                                                           ParcelEntity.id.in_(payload.parcel_entity_ids),
                                                           ParcelEntity.status == "active")))
     if len(entities) != len(set(payload.parcel_entity_ids)):
         raise HTTPException(404, "Every parcel in a geometry changeset must belong to this project")
+    if payload.successor_ids:
+        raise HTTPException(422, "Successor identities are server-generated and cannot be supplied by the client")
     if payload.operation == "split" and len(payload.parcel_entity_ids) != 1:
         raise HTTPException(422, "A split has exactly one approved parent parcel")
     if payload.operation in {"merge", "shared_edge"} and len(payload.parcel_entity_ids) < 2:
@@ -707,9 +851,25 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
         raise HTTPException(422, "Split/merge requires an explicit reviewed attribute source")
     if payload.attribute_source_id:
         predecessor_members = set(db.scalars(select(ParcelSourceLink.source_feature_id).where(
+            ParcelSourceLink.project_id == project_id,
             ParcelSourceLink.parcel_entity_id.in_(payload.parcel_entity_ids))))
         if payload.attribute_source_id not in predecessor_members:
             raise HTTPException(422, "Attribute source must be linked to an affected predecessor parcel")
+        attribute_source = db.get(SourceFeature, payload.attribute_source_id)
+        attribute_dataset = db.get(Dataset, attribute_source.dataset_id) if attribute_source else None
+        if not attribute_source or not attribute_dataset or attribute_dataset.project_id != project_id:
+            raise HTTPException(422, "Attribute source must belong to the affected project")
+    member_source_ids = set(db.scalars(select(ParcelSourceLink.source_feature_id).where(
+        ParcelSourceLink.project_id == project_id,
+        ParcelSourceLink.parcel_entity_id.in_(payload.parcel_entity_ids))))
+    if not set(payload.attribute_sources.values()).issubset(member_source_ids):
+        raise HTTPException(422, "Every attribute precedence source must be linked to an affected parcel")
+    for field, source_id in payload.attribute_sources.items():
+        source = db.get(SourceFeature, source_id)
+        if not source or field not in {**source.raw_attributes, **(source.canonical_attributes or {})}:
+            raise HTTPException(422, "Attribute precedence field must exist on the selected source")
+    if payload.attribute_overrides:
+        raise HTTPException(422, "Geometry changes cannot silently override source attributes; select per-field evidence")
     try:
         measurements = geometry_measurements(db, payload.parcel_entity_ids, payload.draft_geometries)
     except ValueError as exc:
@@ -719,6 +879,8 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
     change_id = uid()
     draft_geometries = dict(payload.draft_geometries)
     successor_ids = list(payload.successor_ids)
+    measurements["before_fingerprint"] = canonical_sha256(measurements["before_geometries"])
+    measurements["policy"] = processing_policy(db, project_id)
     if payload.operation in {"split", "merge"}:
         successor_ids = [uid() for _ in draft_geometries]
         draft_geometries = {successor_id: geometry for successor_id, geometry in zip(successor_ids, draft_geometries.values())}
@@ -727,8 +889,9 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
                                 canonical_key=f"{payload.operation}:{change_id}:{successor_ids.index(successor_id)}", status="draft"))
         db.flush()
         for successor_id in successor_ids:
-            db.add(ParcelSourceLink(project_id=project_id, parcel_entity_id=successor_id,
-                                    source_feature_id=payload.attribute_source_id, link_status="derived_evidence"))
+            for source_id in sorted(member_source_ids):
+                db.add(ParcelSourceLink(project_id=project_id, parcel_entity_id=successor_id,
+                                        source_feature_id=source_id, link_status="derived_evidence"))
             db.add(ParcelSelection(parcel_entity_id=successor_id, geometry_source_id=None,
                                    attribute_source_id=payload.attribute_source_id,
                                    attribute_sources=payload.attribute_sources, actor_id=user.id,
@@ -758,11 +921,48 @@ def list_geometry_changes(project_id: str, db: Db, user: CurrentUser):
 @app.post("/api/projects/{project_id}/geometry-changes/{change_id}/decision")
 def decide_geometry_changeset(project_id: str, change_id: str, payload: GeometryDecision, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True, review=True)
+    db.execute(update(Project).where(Project.id == project_id).values(workflow_revision=Project.workflow_revision))
     change = db.get(GeometryChangeSet, change_id)
     if not change or change.project_id != project_id:
         raise HTTPException(404, "Geometry changeset not found")
     if change.revision != payload.expected_revision or change.status in {"approved", "rejected"}:
         raise HTTPException(409, "Geometry changeset is stale or final")
+    predecessors = list(db.scalars(select(ParcelEntity).where(
+        ParcelEntity.project_id == project_id,
+        ParcelEntity.id.in_(change.predecessor_ids or []))))
+    if len(predecessors) != len(set(change.predecessor_ids or [])):
+        raise HTTPException(409, "Geometry changeset contains a predecessor outside this project")
+    successors = list(db.scalars(select(ParcelEntity).where(
+        ParcelEntity.project_id == project_id,
+        ParcelEntity.id.in_(change.successor_ids or []))))
+    if len(successors) != len(set(change.successor_ids or [])):
+        raise HTTPException(409, "Geometry changeset contains a successor outside this project")
+    affected = list(db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id,
+                             ParcelEntity.id.in_(change.parcel_entity_ids or []), ParcelEntity.status == "active")))
+    if len(affected) != len(set(change.parcel_entity_ids or [])):
+        raise HTTPException(409, "Affected parcels are no longer active; refresh canonical geometry")
+    if change.operation in {"move", "shared_edge"} and (change.successor_ids or change.predecessor_ids):
+        raise HTTPException(409, "Non-creating operation contains unexpected identity mutations")
+    if change.operation in {"split", "merge"} and any(
+        item.status != "draft" or not (item.canonical_key or "").startswith(f"{change.operation}:{change.id}:")
+        for item in successors):
+        raise HTTPException(409, "Successor does not belong to this geometry changeset")
+    if set(change.draft_geometries) != set(change.successor_ids or change.parcel_entity_ids):
+        raise HTTPException(409, "Draft keys do not match this operation's identities")
+    if payload.decision == "approved":
+        measured = geometry_measurements(db, change.parcel_entity_ids, change.draft_geometries)
+        if canonical_sha256(measured["before_geometries"]) != change.measurements.get("before_fingerprint"):
+            raise HTTPException(409, "Canonical geometry changed since this draft; submit a refreshed draft")
+        if change.measurements.get("policy") != processing_policy(db, project_id):
+            raise HTTPException(409, "Processing policy changed since this draft")
+    claimed = db.execute(update(GeometryChangeSet).where(GeometryChangeSet.id == change.id,
+                         GeometryChangeSet.revision == payload.expected_revision,
+                         GeometryChangeSet.status.in_(["draft", "deferred"]))
+                         .values(status=payload.decision, revision=payload.expected_revision + 1)
+                         .execution_options(synchronize_session=False))
+    if not claimed.rowcount:
+        db.rollback()
+        raise HTTPException(409, "Concurrent geometry decision won; refresh before retrying")
     change.status = payload.decision
     change.rationale = f"{change.rationale}\nDecision: {payload.rationale}"
     change.decision_rationale = payload.rationale
@@ -771,14 +971,10 @@ def decide_geometry_changeset(project_id: str, change_id: str, payload: Geometry
     if payload.decision == "approved":
         change.approved_geometries = change.draft_geometries
         change.approved_by = user.id
-        for predecessor_id in change.predecessor_ids:
-            predecessor = db.get(ParcelEntity, predecessor_id)
-            if predecessor:
-                predecessor.status = "superseded"
-        for successor_id in change.successor_ids:
-            successor = db.get(ParcelEntity, successor_id)
-            if successor:
-                successor.status = "active"
+        for predecessor in predecessors:
+            predecessor.status = "superseded"
+        for successor in successors:
+            successor.status = "active"
         # Publication still requires an explicit validated baseline/change. The
         # approved artifact is recorded here and never mutates original uploads.
         audit(db, "geometry_changeset_approved", user.id, project_id, "geometry_changeset", change.id,
@@ -848,6 +1044,14 @@ def create_ground_control(project_id: str, payload: GroundControlRequest, db: Db
           {"dataset_id": payload.dataset_id, "method": payload.method, "residuals": session.residuals})
     db.commit()
     return ground_control_response(session)
+
+
+@app.get("/api/projects/{project_id}/ground-control")
+def list_ground_control(project_id: str, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user)
+    return [ground_control_response(session) for session in db.scalars(
+        select(GroundControlSession).where(GroundControlSession.project_id == project_id)
+        .order_by(GroundControlSession.created_at.desc()))]
 
 
 @app.post("/api/projects/{project_id}/ground-control/{session_id}/approve")
@@ -992,10 +1196,37 @@ def list_rankers(project_id: str, db: Db, user: CurrentUser):
         ModelArtifact.project_id == project_id).order_by(ModelArtifact.created_at.desc()))]
 
 
+@app.post("/api/projects/{project_id}/ranker/{artifact_id}/activation")
+def activate_ranker(project_id: str, artifact_id: str, payload: RankerActivationRequest, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True, review=True)
+    artifact = db.get(ModelArtifact, artifact_id)
+    if not artifact or artifact.project_id != project_id:
+        raise HTTPException(404, "Ranker artifact not found")
+    if payload.active:
+        validation = (artifact.metrics or {}).get("splits", {}).get("validation", {})
+        if not validation.get("count"):
+            raise HTTPException(409, "A held-out validation split is required before activation")
+        for other in db.scalars(select(ModelArtifact).where(ModelArtifact.project_id == project_id,
+                                                            ModelArtifact.model_type == artifact.model_type)):
+            other.activation_status = "inactive"
+        artifact.activation_status = "active"
+        artifact.activated_by = user.id
+        artifact.activated_at = datetime.now(timezone.utc)
+    else:
+        artifact.activation_status = "inactive"
+        artifact.activated_by = user.id
+        artifact.activated_at = datetime.now(timezone.utc)
+    audit(db, "ranker_activation_changed", user.id, project_id, "model_artifact", artifact.id,
+          {"active": payload.active, "version": artifact.version})
+    db.commit()
+    return model_artifact_response(artifact)
+
+
 def model_artifact_response(artifact: ModelArtifact) -> dict:
     return {"id": artifact.id, "model_type": artifact.model_type, "version": artifact.version,
             "artifact": artifact.artifact, "metrics": artifact.metrics, "dataset_fingerprint": artifact.dataset_fingerprint,
-            "seed": artifact.seed, "created_at": artifact.created_at}
+             "seed": artifact.seed, "activation_status": artifact.activation_status,
+             "activated_by": artifact.activated_by, "activated_at": artifact.activated_at, "created_at": artifact.created_at}
 
 
 @app.post("/api/projects/{project_id}/field-assignments", status_code=201)
@@ -1038,6 +1269,29 @@ def list_field_assignments(project_id: str, db: Db, user: CurrentUser):
     return [assignment_response(assignment) for assignment in assignments]
 
 
+@app.patch("/api/projects/{project_id}/field-assignments/{assignment_id}")
+def update_field_assignment(project_id: str, assignment_id: str, payload: AssignmentUpdateRequest,
+                            db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True, review=True)
+    assignment = db.get(FieldAssignment, assignment_id)
+    if not assignment or assignment.project_id != project_id:
+        raise HTTPException(404, "Assignment not found")
+    if assignment.revision != payload.expected_revision:
+        raise HTTPException(409, "Assignment changed; refresh before updating")
+    if payload.expires_at is not None and utc_expired(payload.expires_at):
+        raise HTTPException(422, "Assignment expiry must be in the future")
+    if payload.status is not None:
+        assignment.status = payload.status
+    if payload.expires_at is not None:
+        assignment.expires_at = payload.expires_at
+    assignment.revision += 1
+    audit(db, "field_assignment_updated", user.id, project_id, "field_assignment", assignment.id,
+          {"status": assignment.status, "expires_at": assignment.expires_at, "revision": assignment.revision})
+    touch_project(db, project_id)
+    db.commit()
+    return assignment_response(assignment)
+
+
 @app.get("/api/projects/{project_id}/field-assignments/{assignment_id}/reference")
 def field_assignment_reference(project_id: str, assignment_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, capability="fieldwork")
@@ -1058,12 +1312,14 @@ def field_assignment_reference(project_id: str, assignment_id: str, db: Db, user
         if not selection:
             continue
         attribute = db.get(SourceFeature, selection.attribute_source_id)
-        geometry = db.get(SourceFeature, selection.geometry_source_id) if selection.geometry_source_id else None
         if not attribute:
             continue
         values = attribute.canonical_attributes or attribute.raw_attributes
+        from shapely.geometry import mapping as geometry_mapping
+        resolved, origin = resolve_canonical_geometry(db, entity.id)
         output.append({"parcel_entity_id": entity.id, "attributes": {key: values.get(key) for key in allowed},
-                       "geometry": geometry.normalized_geometry if geometry else None})
+                       "geometry": geometry_mapping(resolved) if resolved is not None else None,
+                       "geometry_origin": origin})
     return {"assignment_id": assignment.id, "expires_at": assignment.expires_at, "features": output}
 
 
@@ -1150,15 +1406,31 @@ def field_evidence_response(evidence: FieldEvidence) -> dict:
 
 @app.post("/api/projects/{project_id}/query")
 def structured_query(project_id: str, payload: QueryRequest, db: Db, user: CurrentUser):
-    ensure_project_access(db, project_id, user)
+    ensure_project_membership(db, project_id, user)
     plan = parse_structured_query(payload.query)
     plan["limit"] = payload.limit
+    plan["offset"] = payload.offset
+    if payload.ward:
+        plan["filters"]["ward"] = payload.ward
+    if payload.date_from:
+        plan["filters"]["date_from"] = payload.date_from.isoformat()
+    if payload.date_to:
+        plan["filters"]["date_to"] = payload.date_to.isoformat()
+    if payload.bbox:
+        if payload.bbox[0] > payload.bbox[2] or payload.bbox[1] > payload.bbox[3]:
+            raise HTTPException(422, "bbox must be minx,miny,maxx,maxy")
+        plan["filters"]["bbox"] = payload.bbox
+    if payload.radius_m is not None:
+        if payload.longitude is None or payload.latitude is None:
+            raise HTTPException(422, "longitude and latitude are required with radius_m")
+        plan["filters"].update({"longitude": payload.longitude, "latitude": payload.latitude,
+                                 "radius_m": payload.radius_m})
     if plan["kind"] == "help":
         return {"plan": plan, "clarification": "Ask for conflicts by ward, missing links, dated changes, or nearby tasks."}
     rows: list[dict] = []
     if plan["kind"] == "conflicts":
         conflicts_rows = list(db.scalars(select(TopologyConflict).where(TopologyConflict.project_id == project_id)
-                                        .order_by(TopologyConflict.created_at.desc()).limit(payload.limit)))
+                                        .order_by(TopologyConflict.created_at.desc())))
         rows = [{"id": row.id, "type": row.conflict_type, "severity": row.severity, "description": row.description,
                  "details": row.details} for row in conflicts_rows]
         if plan["filters"].get("ward"):
@@ -1169,7 +1441,7 @@ def structured_query(project_id: str, payload: QueryRequest, db: Db, user: Curre
         rows = [{"feature_id": feature.id, "dataset_id": feature.dataset_id, "original_id": feature.original_id}
                 for feature in db.scalars(select(SourceFeature).join(Dataset, Dataset.id == SourceFeature.dataset_id)
                                           .where(Dataset.project_id == project_id, SourceFeature.status == "processed"))
-                if feature.id not in linked][:payload.limit]
+                if feature.id not in linked]
     elif plan["kind"] == "area_threshold":
         threshold = plan["filters"].get("area_threshold")
         if threshold is None:
@@ -1181,6 +1453,10 @@ def structured_query(project_id: str, payload: QueryRequest, db: Db, user: Curre
             raw_area = values.get("recorded_area", values.get("area", values.get("area_m2")))
             try:
                 if float(raw_area) >= float(threshold):
+                    if payload.bbox and (not feature.normalized_geometry or
+                        shape(feature.normalized_geometry).bounds[2] < payload.bbox[0] or shape(feature.normalized_geometry).bounds[0] > payload.bbox[2] or
+                        shape(feature.normalized_geometry).bounds[3] < payload.bbox[1] or shape(feature.normalized_geometry).bounds[1] > payload.bbox[3]):
+                        continue
                     rows.append({"feature_id": feature.id, "dataset_id": feature.dataset_id, "original_id": feature.original_id,
                                  "area": raw_area, "units": values.get("area_units")})
             except (TypeError, ValueError):
@@ -1188,13 +1464,28 @@ def structured_query(project_id: str, payload: QueryRequest, db: Db, user: Curre
             if len(rows) >= payload.limit:
                 break
     elif plan["kind"] == "dated_changes":
-        rows = [{"id": row.id, "type": row.change_type, "status": row.status, "evidence": row.evidence}
-                for row in db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project_id)
-                                      .order_by(ChangeProposal.created_at.desc()).limit(payload.limit))]
+        rows = [{"id": row.id, "type": row.change_type, "status": row.status, "evidence": row.evidence,
+                 "created_at": row.created_at}
+             for row in db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project_id)
+                                      .order_by(ChangeProposal.created_at.desc()))]
     elif plan["kind"] == "nearby_tasks":
-        rows = [assignment_response(row) for row in db.scalars(select(FieldAssignment).where(
-            FieldAssignment.project_id == project_id).order_by(FieldAssignment.created_at.desc()).limit(payload.limit))]
-    return {"plan": plan, "filters": plan["filters"], "rows": rows, "read_only": True, "truncated": len(rows) >= payload.limit}
+        ensure_project_access(db, project_id, user, capability="fieldwork")
+        assignment_query = select(FieldAssignment).where(FieldAssignment.project_id == project_id)
+        if user.role == "field":
+            assignment_query = assignment_query.where(FieldAssignment.assignee_id == user.id,
+                                                       FieldAssignment.status.in_(["assigned", "active"]))
+        rows = [assignment_response(row) for row in db.scalars(assignment_query.order_by(FieldAssignment.created_at.desc()))
+                if not utc_expired(row.expires_at)]
+    if payload.ward:
+        rows = [row for row in rows if payload.ward.casefold() in json.dumps(row).casefold()]
+    if payload.date_from or payload.date_to:
+        rows = [row for row in rows if not row.get("created_at") or
+                (not payload.date_from or str(row["created_at"])[:10] >= payload.date_from.isoformat()) and
+                (not payload.date_to or str(row["created_at"])[:10] <= payload.date_to.isoformat())]
+    total = len(rows)
+    rows = rows[payload.offset:payload.offset + payload.limit]
+    return {"plan": plan, "filters": plan["filters"], "rows": rows, "total": total,
+            "offset": payload.offset, "read_only": True, "truncated": payload.offset + len(rows) < total}
 
 
 @app.post("/api/projects/{project_id}/compliance-rules", status_code=201)
@@ -1270,7 +1561,23 @@ def create_citizen_grant(project_id: str, payload: CitizenGrantRequest, db: Db, 
     if (not citizen or citizen.role != "citizen" or not project_member(db, project_id, citizen.id)
             or not entity or entity.project_id != project_id):
         raise HTTPException(422, "An explicit citizen account and project parcel are required")
+    latest_version = db.scalar(select(PublishedVersion).where(
+        PublishedVersion.project_id == project_id,
+        PublishedVersion.id.in_(select(PublicationFeature.version_id).where(
+            PublicationFeature.parcel_entity_id == entity.id))).order_by(PublishedVersion.version_number.desc()))
+    if not latest_version:
+        raise HTTPException(409, "Citizen grants require a frozen published parcel record")
+    frozen = db.scalar(select(PublicationFeature).where(PublicationFeature.version_id == latest_version.id,
+                                                       PublicationFeature.parcel_entity_id == entity.id))
+    if not frozen:
+        raise HTTPException(409, "The parcel is not present in the latest published version")
+    available_fields = set(frozen.attributes or {})
+    if frozen.geometry:
+        available_fields.add("geometry")
+    if not set(payload.fields).issubset(available_fields):
+        raise HTTPException(422, "Every granted field must exist in the frozen published record")
     grant = CitizenGrant(project_id=project_id, citizen_id=citizen.id, parcel_entity_id=entity.id,
+                         published_version_id=latest_version.id,
                          fields=sorted(set(payload.fields)), expires_at=payload.expires_at, granted_by=user.id)
     db.add(grant)
     audit(db, "citizen_grant_created", user.id, project_id, "citizen_grant", grant.id,
@@ -1291,6 +1598,31 @@ def list_citizen_grants(project_id: str, db: Db, user: CurrentUser):
     return [citizen_grant_response(grant) for grant in grants]
 
 
+@app.patch("/api/projects/{project_id}/citizen-grants/{grant_id}")
+def update_citizen_grant(project_id: str, grant_id: str, payload: CitizenGrantUpdateRequest,
+                         db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True, review=True)
+    grant = db.get(CitizenGrant, grant_id)
+    if not grant or grant.project_id != project_id:
+        raise HTTPException(404, "Citizen grant not found")
+    allowed_fields = {"parcel_id", "survey_number", "property_account", "village", "village_code", "district", "ward",
+                      "recorded_area", "area_units", "geometry", "status", "capture_date"}
+    if payload.fields is not None and not set(payload.fields).issubset(allowed_fields):
+        raise HTTPException(422, "Citizen grants can contain only approved public fields")
+    if payload.expires_at is not None and utc_expired(payload.expires_at):
+        raise HTTPException(422, "Grant expiry must be in the future")
+    if payload.status is not None:
+        grant.status = payload.status
+    if payload.fields is not None:
+        grant.fields = sorted(set(payload.fields))
+    if payload.expires_at is not None:
+        grant.expires_at = payload.expires_at
+    audit(db, "citizen_grant_updated", user.id, project_id, "citizen_grant", grant.id,
+          {"status": grant.status, "fields": grant.fields, "expires_at": grant.expires_at})
+    db.commit()
+    return citizen_grant_response(grant)
+
+
 @app.get("/api/projects/{project_id}/citizen-records")
 def citizen_records(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, capability="citizen")
@@ -1301,20 +1633,36 @@ def citizen_records(project_id: str, db: Db, user: CurrentUser):
     output = []
     for grant in grants:
         entity = db.get(ParcelEntity, grant.parcel_entity_id)
-        selection = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == grant.parcel_entity_id))
-        published = db.scalar(select(PublicationFeature.id).join(PublishedVersion, PublishedVersion.id == PublicationFeature.version_id)
-                              .where(PublishedVersion.project_id == project_id,
-                                     PublicationFeature.parcel_entity_id == grant.parcel_entity_id,
-                                     PublishedVersion.status == "published"))
-        if not entity or not selection or not published:
+        if not entity:
             continue
-        source = db.get(SourceFeature, selection.attribute_source_id)
-        if not source:
+        if grant.published_version_id:
+            version = db.scalar(select(PublishedVersion).where(
+                PublishedVersion.id == grant.published_version_id,
+                PublishedVersion.project_id == project_id,
+                PublishedVersion.status == "published"))
+        else:
+            # Legacy grants created before frozen-version binding are resolved
+            # deterministically to the latest publication containing the parcel.
+            version = db.scalar(select(PublishedVersion).where(
+                PublishedVersion.project_id == project_id,
+                PublishedVersion.status == "published",
+                PublishedVersion.id.in_(select(PublicationFeature.version_id).where(
+                    PublicationFeature.parcel_entity_id == grant.parcel_entity_id)))
+                .order_by(PublishedVersion.version_number.desc()))
+        if not version:
             continue
-        values = {field: (source.canonical_attributes or source.raw_attributes).get(field) for field in grant.fields}
-        geometry_source = db.get(SourceFeature, selection.geometry_source_id) if selection.geometry_source_id else None
+        published = db.scalar(select(PublicationFeature).where(
+            PublicationFeature.version_id == version.id,
+            PublicationFeature.parcel_entity_id == grant.parcel_entity_id))
+        if not published:
+            continue
+        values = {field: published.attributes.get(field) for field in grant.fields if field != "geometry"}
         output.append({"parcel_entity_id": entity.id, "fields": values, "grant_id": grant.id,
-                       "geometry": (geometry_source or source).normalized_geometry if "geometry" in grant.fields else None})
+                       "version_id": version.id, "version": version.version_number,
+                       "geometry": published.geometry if "geometry" in grant.fields else None,
+                       "provenance": {"published_version_id": version.id, "version": version.version_number,
+                                      "published_at": version.created_at,
+                                      "manifest_sha256": version.manifest_sha256}})
     return output
 
 
@@ -1345,9 +1693,25 @@ def list_citizen_cases(project_id: str, db: Db, user: CurrentUser):
     return [citizen_case_response(case) for case in db.scalars(query.order_by(CitizenCase.created_at.desc()))]
 
 
+@app.patch("/api/projects/{project_id}/citizen-cases/{case_id}")
+def respond_citizen_case(project_id: str, case_id: str, payload: CitizenCaseResponseRequest,
+                         db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True, review=True)
+    case = db.get(CitizenCase, case_id)
+    if not case or case.project_id != project_id:
+        raise HTTPException(404, "Citizen case not found")
+    case.status = payload.status
+    case.response = payload.response
+    audit(db, "citizen_case_responded", user.id, project_id, "citizen_case", case.id,
+          {"status": case.status})
+    db.commit()
+    return citizen_case_response(case)
+
+
 def citizen_grant_response(grant: CitizenGrant) -> dict:
     return {"id": grant.id, "citizen_id": grant.citizen_id, "parcel_entity_id": grant.parcel_entity_id,
-            "fields": grant.fields, "expires_at": grant.expires_at, "status": grant.status, "created_at": grant.created_at}
+            "published_version_id": grant.published_version_id, "fields": grant.fields, "expires_at": grant.expires_at,
+            "status": grant.status, "created_at": grant.created_at}
 
 
 def citizen_case_response(case: CitizenCase) -> dict:
@@ -1444,7 +1808,14 @@ def list_parcels(project_id: str, db: Db, user: CurrentUser):
     for entity in db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id, ParcelEntity.status == "active")):
         members = list(db.scalars(select(ParcelSourceLink.source_feature_id).where(ParcelSourceLink.parcel_entity_id == entity.id)))
         selected = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == entity.id))
+        try:
+            geometry, geometry_origin = resolve_canonical_geometry(db, entity.id)
+            from shapely.geometry import mapping as geometry_mapping
+            geometry_data = geometry_mapping(geometry) if geometry is not None else None
+        except ValueError:
+            geometry_data, geometry_origin = None, None
         output.append({"id": entity.id, "source_feature_ids": members,
+                       "geometry": geometry_data, "geometry_origin": geometry_origin,
                        "selection": {"geometry_source_id": selected.geometry_source_id, "attribute_source_id": selected.attribute_source_id,
                                      "revision": selected.revision, "rationale": selected.rationale,
                                      "attribute_sources": selected.attribute_sources} if selected else None})
@@ -1525,20 +1896,33 @@ def rollback_version(project_id: str, version_id: str, db: Db, user: CurrentUser
     project = db.get(Project, project_id)
     project.workflow_revision += 1
     project.validated_revision = project.workflow_revision
+    source_features = list(db.scalars(select(PublicationFeature).where(PublicationFeature.version_id == source.id)
+                              .order_by(PublicationFeature.id)))
+    rollback_at = datetime.now(timezone.utc).isoformat()
+    cloned_lineages = [{**feature.lineage, "rollback_of_version_id": source.id,
+                        "rollback_created_at": rollback_at} for feature in source_features]
     manifest = {**source.lineage_manifest, "rollback_of_version_id": source.id,
-                "rollback_created_at": datetime.now(timezone.utc).isoformat()}
+                "rollback_created_at": rollback_at,
+                "rollback_source_manifest_trusted": bool(source.manifest_sha256 and source.output_sha256),
+                "features": cloned_lineages}
+    output_context = canonical_output_context([{"parcel_entity_id": feature.parcel_entity_id,
+                                                "geometry": feature.geometry,
+                                                "attributes": feature.attributes,
+                                                "lineage": lineage}
+                                               for feature, lineage in zip(source_features, cloned_lineages)])
     version = PublishedVersion(project_id=project_id, version_number=next_version(db, project_id), created_by=user.id,
                                project_revision=project.workflow_revision, base_version_id=source.id,
                                validation_report={"valid": True, "type": "traceable_rollback", "source_version": source.id},
-                               lineage_manifest=manifest, excluded_records=source.excluded_records)
+                               lineage_manifest=manifest, excluded_records=source.excluded_records,
+                               manifest_sha256=canonical_sha256(manifest), output_sha256=canonical_sha256(output_context))
     db.add(version)
     db.flush()
-    for feature in db.scalars(select(PublicationFeature).where(PublicationFeature.version_id == source.id)):
+    for feature, lineage in zip(source_features, cloned_lineages):
         from shapely.geometry import shape
         from .services import spatial_column
         db.add(PublicationFeature(version_id=version.id, source_feature_id=feature.source_feature_id,
                                   parcel_entity_id=feature.parcel_entity_id, attributes=feature.attributes,
-                                  geometry=feature.geometry, lineage={**feature.lineage, "rollback_of_version_id": source.id},
+                                   geometry=feature.geometry, lineage=lineage,
                                   **spatial_column(shape(feature.geometry) if feature.geometry else None, "EPSG:4326")))
     audit(db, "version_rollback", user.id, project_id, "published_version", version.id,
           {"source_version_id": source.id, "version": version.version_number})
@@ -1669,8 +2053,7 @@ def ogc_landing():
 def ogc_conformance():
     return {"conformsTo": ["http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
                             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
-                            "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/landing-page",
-                            "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html"]}
+                            "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/landing-page"]}
 
 
 @app.get("/api/ogc/collections")
@@ -1682,6 +2065,17 @@ def ogc_collections(db: Db, user: CurrentUser):
                               "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
                               "links": [{"rel": "items", "href": f"/api/ogc/collections/{project.id}/items"}]}
                              for project in projects]}
+
+
+@app.get("/api/ogc/collections/{project_id}")
+def ogc_collection(project_id: str, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user)
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Collection not found")
+    return {"id": project.id, "title": project.name, "description": "Reviewed published parcel features",
+            "itemType": "feature", "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
+            "links": [{"rel": "items", "href": f"/api/ogc/collections/{project.id}/items"}]}
 
 
 @app.get("/api/ogc/collections/{project_id}/items")
@@ -1726,11 +2120,29 @@ def ogc_items(project_id: str, db: Db, user: CurrentUser, version_id: str | None
         matched = db.scalar(select(func.count()).where(PublicationFeature.version_id == version.id)) or 0
     elif not database_bbox:
         matched = len(filtered)
+    next_query = f"version_id={version.id}&limit={limit}&offset={offset + limit}"
+    if bbox:
+        next_query += f"&bbox={bbox}"
     return {"type": "FeatureCollection", "features": [{"type": "Feature", "id": feature.parcel_entity_id or feature.id,
-             "geometry": feature.geometry, "properties": {**feature.attributes, "_lineage": feature.lineage}}
-             for feature in page], "numberMatched": matched, "numberReturned": len(page),
-             "links": ([{"rel": "next", "href": f"/api/ogc/collections/{project_id}/items?version_id={version.id}&limit={limit}&offset={offset + limit}"}]
+              "geometry": feature.geometry, "properties": {**feature.attributes, "_lineage": feature.lineage}}
+              for feature in page], "numberMatched": matched, "numberReturned": len(page),
+             "links": ([{"rel": "next", "href": f"/api/ogc/collections/{project_id}/items?{next_query}"}]
                        if offset + limit < matched else [])}
+
+
+@app.get("/api/ogc/collections/{project_id}/items/{item_id}")
+def ogc_item(project_id: str, item_id: str, db: Db, user: CurrentUser, version_id: str | None = None):
+    ensure_project_access(db, project_id, user)
+    version = db.get(PublishedVersion, version_id) if version_id else db.scalar(select(PublishedVersion).where(
+        PublishedVersion.project_id == project_id).order_by(PublishedVersion.version_number.desc()))
+    if not version or version.project_id != project_id:
+        raise HTTPException(404, "Reviewed version not found")
+    feature = db.scalar(select(PublicationFeature).where(PublicationFeature.version_id == version.id,
+                                                         (PublicationFeature.parcel_entity_id == item_id) | (PublicationFeature.id == item_id)))
+    if not feature:
+        raise HTTPException(404, "Published feature not found")
+    return {"type": "Feature", "id": feature.parcel_entity_id or feature.id, "geometry": feature.geometry,
+            "properties": {**feature.attributes, "_lineage": feature.lineage}}
 
 
 @app.post("/api/projects/{project_id}/jobs")

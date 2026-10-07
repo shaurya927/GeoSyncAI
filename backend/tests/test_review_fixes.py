@@ -7,7 +7,7 @@ import subprocess
 import sys
 import uuid
 
-from app.models import CitizenGrant, Dataset, FieldAssignment, Job, ParcelEntity
+from app.models import CitizenGrant, Dataset, FieldAssignment, Job, ParcelEntity, ParcelSourceLink
 from app.verify_artifact import digest
 
 
@@ -41,8 +41,23 @@ def test_limited_roles_cannot_read_source_features_or_create_projects(client, au
         assert client.get(f"/api/ogc/collections/{project_id}/items", headers=headers(token)).status_code == 403
         capabilities = client.get(f"/api/projects/{project_id}/capabilities", headers=headers(token))
         assert capabilities.status_code == 200 and capabilities.json()["read_departmental"] is False
+    assert client.get(f"/api/projects/{project_id}/field-assignments", headers=headers(citizen)).status_code == 403
+    assert client.get(f"/api/projects/{project_id}/citizen-grants", headers=headers(field)).status_code == 403
     assert client.post("/api/projects", headers=headers(citizen), json={"name": "blocked"}).status_code == 403
     assert client.get(f"/api/projects/{project_id}", headers=headers(citizen)).status_code == 200
+
+
+def test_global_role_and_project_role_both_gate_review_and_processing(client, auth_token):
+    admin = auth_token("admin"); processor = auth_token("processor"); viewer = auth_token("viewer")
+    project_id = client.post("/api/projects", headers=headers(admin), json={"name": f"intersection-{uuid.uuid4()}"}).json()["id"]
+    assert client.post(f"/api/projects/{project_id}/members", headers=headers(admin),
+                       json={"username": "processor", "project_role": "viewer"}).status_code == 200
+    assert client.post(f"/api/projects/{project_id}/members", headers=headers(admin),
+                       json={"username": "viewer", "project_role": "reviewer"}).status_code == 200
+    assert client.get(f"/api/projects/{project_id}/capabilities", headers=headers(processor)).json()["process"] is False
+    assert client.get(f"/api/projects/{project_id}/capabilities", headers=headers(viewer)).json()["review"] is False
+    assert client.post(f"/api/projects/{project_id}/datasets", headers=headers(processor),
+                       json={"name": "blocked"}).status_code == 403
 
 
 def test_measurement_rejects_geographic_target_and_converts_feet(client, auth_token):
@@ -152,6 +167,65 @@ def test_job_lease_rejects_second_owner_and_queued_cancel_is_terminal(client, au
     assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
 
 
+def test_geometry_change_rejects_cross_project_successor_without_side_effect(client, auth_token, db):
+    admin = auth_token("admin")
+    project_a = client.post("/api/projects", headers=headers(admin), json={"name": f"a-{uuid.uuid4()}"}).json()["id"]
+    project_b = client.post("/api/projects", headers=headers(admin), json={"name": f"b-{uuid.uuid4()}"}).json()["id"]
+    predecessor = ParcelEntity(project_id=project_a, status="active")
+    foreign = ParcelEntity(project_id=project_b, status="active")
+    db.add_all([predecessor, foreign]); db.commit()
+    geometry = {"type": "Polygon", "coordinates": [[[73, 20], [73.001, 20], [73.001, 20.001], [73, 20]]]}
+    response = client.post(f"/api/projects/{project_a}/geometry-changes", headers=headers(admin), json={
+        "operation": "move", "parcel_entity_ids": [predecessor.id], "successor_ids": [foreign.id],
+        "draft_geometries": {predecessor.id: geometry}, "rationale": "malicious cross-project successor"})
+    assert response.status_code == 422
+    db.expire_all(); db.refresh(foreign)
+    assert foreign.status == "active"
+
+
+def test_citizen_records_are_bound_to_frozen_publication_not_working_selection(client, auth_token, db):
+    admin = auth_token("admin"); citizen = auth_token("citizen")
+    project_id = client.post("/api/projects", headers=headers(admin), json={"name": f"frozen-{uuid.uuid4()}"}).json()["id"]
+    assert client.post(f"/api/projects/{project_id}/members", headers=headers(admin),
+                       json={"username": "citizen", "project_role": "citizen"}).status_code == 200
+    geometry = {"type": "Polygon", "coordinates": [[[73, 20], [73.001, 20], [73.001, 20.001], [73, 20]]]}
+
+    def upload_record(name: str, area: int):
+        body = json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature", "id": name,
+            "properties": {"parcel_id": "P-1", "recorded_area": area}, "geometry": geometry}]}).encode()
+        response = client.post(f"/api/projects/{project_id}/datasets/upload", headers=headers(admin),
+                               files={"file": (f"{name}.geojson", body, "application/geo+json")},
+                               data={"declared_crs": "EPSG:4326"})
+        assert response.status_code == 201, response.text
+        dataset = response.json()
+        feature = client.get(f"/api/projects/{project_id}/datasets/{dataset['id']}/features", headers=headers(admin)).json()[0]
+        mapping = client.post(f"/api/projects/{project_id}/datasets/{dataset['id']}/mapping", headers=headers(admin),
+                              json={"mapping": {"parcel_id": "parcel_id", "recorded_area": "recorded_area"}, "confirm": True})
+        assert mapping.status_code == 200, mapping.text
+        return dataset, feature
+
+    first, feature = upload_record("frozen-100", 100)
+    baseline = client.post(f"/api/projects/{project_id}/features/{feature['id']}/baseline", headers=headers(admin),
+                           json={"geometry_source_id": feature["id"], "attribute_source_id": feature["id"], "rationale": "Frozen baseline"})
+    assert baseline.status_code == 200, baseline.text
+    published = client.post(f"/api/projects/{project_id}/validate", headers=headers(admin)); assert published.status_code == 200
+    published = client.post(f"/api/projects/{project_id}/publish", headers=headers(admin)); assert published.status_code == 200, published.text
+    parcel_id = client.get(f"/api/projects/{project_id}/parcels", headers=headers(admin)).json()[0]["id"]
+    grant = client.post(f"/api/projects/{project_id}/citizen-grants", headers=headers(admin), json={
+        "citizen_username": "citizen", "parcel_entity_id": parcel_id, "fields": ["recorded_area"]})
+    assert grant.status_code == 201, grant.text
+    second, second_feature = upload_record("working-999", 999)
+    db.add(ParcelSourceLink(project_id=project_id, parcel_entity_id=parcel_id, source_feature_id=second_feature["id"], link_status="accepted"))
+    db.commit()
+    changed = client.post(f"/api/projects/{project_id}/parcels/{parcel_id}/selection", headers=headers(admin), json={
+        "geometry_source_id": feature["id"], "attribute_source_id": second_feature["id"],
+        "expected_revision": 1, "rationale": "Working selection changed after publication"})
+    assert changed.status_code == 200, changed.text
+    records = client.get(f"/api/projects/{project_id}/citizen-records", headers=headers(citizen))
+    assert records.status_code == 200 and records.json()[0]["fields"]["recorded_area"] == 100
+    assert records.json()[0]["version"] == 1 and records.json()[0]["version_id"] == grant.json()["published_version_id"]
+
+
 def test_independent_artifact_cli_detects_output_tampering(tmp_path):
     manifest = {"version": 1, "features": [{"id": "parcel-1"}]}
     output = {"type": "FeatureCollection", "features": [{"id": "parcel-1", "geometry": None,
@@ -208,14 +282,32 @@ def test_one_parent_split_creates_successors_and_publishes_lineage(client, auth_
     assert validation.status_code == 200 and validation.json()["valid"] is True, validation.text
     published = client.post(f"/api/projects/{project_id}/publish", headers=headers(reviewer))
     assert published.status_code == 200, published.text
-    exported = client.get(f"/api/projects/{project_id}/versions/{published.json()['id']}/export?format=geojson", headers=headers(reviewer)).json()
+    first_version = published.json()
+    exported = client.get(f"/api/projects/{project_id}/versions/{first_version['id']}/export?format=geojson", headers=headers(reviewer)).json()
     assert len(exported["features"]) == 2
     assert all(item["properties"]["_lineage"]["geometry_changes"] for item in exported["features"])
-    verified = client.get(f"/api/projects/{project_id}/versions/{published.json()['id']}/verify", headers=headers(reviewer))
+    verified = client.get(f"/api/projects/{project_id}/versions/{first_version['id']}/verify", headers=headers(reviewer))
     assert verified.status_code == 200 and verified.json()["valid"] is True
+    merged = client.post(f"/api/projects/{project_id}/geometry-changes", headers=headers(admin), json={
+        "operation": "merge", "parcel_entity_ids": [item["id"] for item in active],
+        "draft_geometries": {"merged": {"type": "Polygon", "coordinates": [[[73, 20], [73.002, 20], [73.002, 20.001], [73, 20.001], [73, 20]]]}},
+        "attribute_source_id": feature["id"], "rationale": "Recombine reviewed split children"})
+    assert merged.status_code == 200, merged.text
+    approved_merge = client.post(f"/api/projects/{project_id}/geometry-changes/{merged.json()['id']}/decision",
+                                 headers=headers(reviewer), json={"decision": "approved", "expected_revision": 1, "rationale": "Merge approved"})
+    assert approved_merge.status_code == 200, approved_merge.text
+    assert len(client.get(f"/api/projects/{project_id}/parcels", headers=headers(reviewer)).json()) == 1
+    assert client.post(f"/api/projects/{project_id}/validate", headers=headers(reviewer)).json()["valid"] is True
+    second_version = client.post(f"/api/projects/{project_id}/publish", headers=headers(reviewer))
+    assert second_version.status_code == 200, second_version.text
+    rollback = client.post(f"/api/projects/{project_id}/versions/{first_version['id']}/rollback", headers=headers(reviewer))
+    assert rollback.status_code == 200, rollback.text
+    rollback_id = rollback.json()["id"]
+    rollback_verification = client.get(f"/api/projects/{project_id}/versions/{rollback_id}/verify", headers=headers(reviewer))
+    assert rollback_verification.status_code == 200 and rollback_verification.json()["valid"] is True
     raw_path = Path(db.get(Dataset, dataset["id"]).raw_path)
     raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
-    tampered = client.get(f"/api/projects/{project_id}/versions/{published.json()['id']}/verify", headers=headers(reviewer))
+    tampered = client.get(f"/api/projects/{project_id}/versions/{rollback_id}/verify", headers=headers(reviewer))
     assert tampered.status_code == 200 and tampered.json()["valid"] is False and tampered.json()["source_bytes_valid"] is False
     page = client.get(f"/api/ogc/collections/{project_id}/items", headers=headers(reviewer), params={"limit": 1})
     assert page.status_code == 200 and page.json()["numberMatched"] == 2 and page.json()["numberReturned"] == 1

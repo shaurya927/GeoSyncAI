@@ -27,6 +27,12 @@ def canonical_sha256(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
+def canonical_output_context(records) -> list[dict]:
+    return sorted([{"parcel_entity_id": record["parcel_entity_id"], "geometry": record["geometry"],
+                    "attributes": record["attributes"], "lineage": record["lineage"]} for record in records],
+                   key=lambda item: item["parcel_entity_id"] or "")
+
+
 def candidate_snapshot(db, project):
     policy = {**POLICY, 'processing': processing_policy(db, project.id)}
     datasets = {d.id: d for d in db.scalars(select(Dataset).where(Dataset.project_id == project.id))}
@@ -35,7 +41,7 @@ def candidate_snapshot(db, project):
     matches = list(db.scalars(select(MatchProposal).where(MatchProposal.project_id == project.id, MatchProposal.status == "accepted")))
     changes = list(db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project.id, ChangeProposal.status != "superseded").order_by(ChangeProposal.created_at, ChangeProposal.id)))
     geometry_changes = list(db.scalars(select(GeometryChangeSet).where(GeometryChangeSet.project_id == project.id)
-                                      .order_by(GeometryChangeSet.created_at, GeometryChangeSet.id)))
+                                      .order_by(GeometryChangeSet.decision_at, GeometryChangeSet.created_at, GeometryChangeSet.id)))
     reviews = list(db.scalars(select(ReviewDecision).where(ReviewDecision.project_id == project.id).order_by(ReviewDecision.id)))
     mappings = {m.id: m for m in db.scalars(select(SchemaMapping).where(SchemaMapping.project_id == project.id))}
     selections = list(db.scalars(select(ParcelSelection).join(ParcelEntity, ParcelEntity.id == ParcelSelection.parcel_entity_id)
@@ -57,7 +63,7 @@ def candidate_snapshot(db, project):
             failures.append({"parcel_entity_id": selection.parcel_entity_id, "reason": "Selected source is unavailable or quarantined"})
             continue
         geometry = geometry_source.normalized_geometry if geometry_source else None
-        values = dict(attributes.raw_attributes)
+        values = {**attributes.raw_attributes, **(attributes.canonical_attributes or {})}
         for field, source_id in (selection.attribute_sources or {}).items():
             source = sources.get(source_id)
             if not source or source.id not in members:
@@ -86,6 +92,11 @@ def candidate_snapshot(db, project):
             else:
                 failures.append({"change_id": change.id, "reason": "Unresolved change affects selected baseline"})
         applied_geometry_changes = []
+        ancestor_ids = {selection.parcel_entity_id}
+        for item in reversed(geometry_changes):
+            if item.status == "approved" and ancestor_ids.intersection(item.successor_ids or []):
+                ancestor_ids.update(item.predecessor_ids or [])
+                applied_geometry_changes.append(item)
         for geometry_change in geometry_changes:
             affected_ids = set(geometry_change.parcel_entity_ids or []) | set(geometry_change.successor_ids or [])
             if selection.parcel_entity_id not in affected_ids:
@@ -95,10 +106,17 @@ def candidate_snapshot(db, project):
             elif geometry_change.status == "approved":
                 if selection.parcel_entity_id in (geometry_change.approved_geometries or {}):
                     geometry = geometry_change.approved_geometries[selection.parcel_entity_id]
-                    applied_geometry_changes.append(geometry_change)
+                    if geometry_change not in applied_geometry_changes:
+                        applied_geometry_changes.append(geometry_change)
                 else:
                     failures.append({"geometry_change_set_id": geometry_change.id,
-                                     "reason": "Approved geometry changeset has no geometry for the selected parcel"})
+                                      "reason": "Approved geometry changeset has no geometry for the selected parcel"})
+        if applied_geometry_changes:
+            from .advanced import resolve_canonical_geometry
+            from shapely.geometry import mapping as geometry_mapping
+            resolved, _ = resolve_canonical_geometry(db, selection.parcel_entity_id)
+            if resolved is not None:
+                geometry = geometry_mapping(resolved)
         match_ids = sorted(m.id for m in matches if m.left_feature_id in members and m.right_feature_id in members)
         review_ids = sorted(r.id for r in reviews if (r.target_type == "match" and r.target_id in match_ids) or (r.target_type == "change" and r.target_id in applied + rejected))
         source_lineage = []
@@ -201,9 +219,7 @@ def publish(db, project, actor):
         raise ValueError("Candidate revision changed or has not passed validation; validate again")
     lineage_manifest = {"policy": POLICY, "candidate_hash": digest, "validation_report": report,
                         "features": [c["lineage"] for c in candidates], "exclusions": excluded}
-    output_context = sorted([{"parcel_entity_id": c["parcel_entity_id"], "geometry": c["geometry"],
-                              "attributes": c["attributes"], "lineage": c["lineage"]} for c in candidates],
-                            key=lambda item: item["parcel_entity_id"] or "")
+    output_context = canonical_output_context(candidates)
     version = PublishedVersion(project_id=project.id, version_number=next_version(db, project.id), created_by=actor.id,
                                project_revision=project.workflow_revision, validation_report=report,
                                excluded_records=excluded, lineage_manifest=lineage_manifest,

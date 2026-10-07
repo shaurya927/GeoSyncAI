@@ -20,8 +20,8 @@ from pyproj import CRS, Geod
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import (Dataset, ModelArtifact, ParcelEntity, ParcelSelection, ParcelSourceLink,
-                     ReconciliationCase, SourceFeature, TrainingExample)
+from .models import (Dataset, ModelArtifact, ParcelEntity, ParcelSelection,
+                      ReconciliationCase, SourceFeature, TrainingExample, GeometryChangeSet)
 from .services import audit, analysis_crs_for, metric_geometry, touch_project
 from .spatial import check_coordinates, reproject
 
@@ -104,7 +104,6 @@ def measure_geometry(geometry_data: dict[str, Any], source_crs: str, analysis_cr
     check_coordinates(geometry, geographic=source.is_geographic)
     if geometry.is_empty:
         raise ValueError("Empty geometry cannot be measured")
-    bounds = geometry.bounds
     extent_gate: list[str] = []
     display_geometry = geometry if source.to_string() == "EPSG:4326" else reproject(geometry, source_crs, "EPSG:4326")
     display_bounds = display_geometry.bounds
@@ -227,41 +226,82 @@ def fit_control_points(method: str, fitting_points: list[dict[str, Any]], checkp
             "extrapolation_gate": "control-point hull only; outside-hull application requires independent evidence"}
 
 
+def resolve_canonical_geometry(db: Session, parcel_id: str) -> tuple[Any | None, dict[str, Any] | None]:
+    """Resolve the latest approved canonical geometry without reading a draft.
+
+    Derived split/merge entities deliberately have no source geometry selection.
+    Their approved geometry changeset is the authoritative current geometry. A
+    direct selection remains the fallback for ordinary source-backed parcels.
+    """
+    entity = db.get(ParcelEntity, parcel_id)
+    if not entity:
+        raise ValueError("Canonical parcel does not exist")
+    changes = list(db.scalars(select(GeometryChangeSet).where(
+        GeometryChangeSet.project_id == entity.project_id,
+        GeometryChangeSet.status == "approved").order_by(
+            GeometryChangeSet.decision_at.desc(), GeometryChangeSet.created_at.desc(), GeometryChangeSet.id.desc())))
+    for change in changes:
+        geometry_data = (change.approved_geometries or {}).get(parcel_id)
+        if geometry_data:
+            geometry = shape(geometry_data)
+            if geometry.is_empty or not geometry.is_valid:
+                raise ValueError(f"Approved geometry for parcel {parcel_id} is invalid")
+            return geometry, {"kind": "geometry_changeset", "id": change.id, "revision": change.revision,
+                             "operation": change.operation}
+    selection = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == parcel_id))
+    if not selection or not selection.geometry_source_id:
+        return None, None
+    source = db.get(SourceFeature, selection.geometry_source_id)
+    if not source:
+        raise ValueError(f"Selected geometry source for parcel {parcel_id} is unavailable")
+    dataset = db.get(Dataset, source.dataset_id)
+    if not dataset or dataset.project_id != entity.project_id:
+        raise ValueError(f"Selected geometry source for parcel {parcel_id} is outside the project")
+    if source.status != "processed" or not source.normalized_geometry:
+        raise ValueError(f"Selected geometry source for parcel {parcel_id} is not spatially ready")
+    geometry = shape(source.normalized_geometry)
+    return geometry, {"kind": "source_selection", "source_feature_id": source.id, "selection_id": selection.id,
+                      "selection_revision": selection.revision}
+
+
 def geometry_measurements(db: Session, parcel_ids: list[str], draft_geometries: dict[str, dict[str, Any]]) -> dict[str, Any]:
     before: dict[str, float] = {}
     before_geometries: dict[str, dict[str, Any]] = {}
     after: dict[str, float] = {}
+    before_origins: dict[str, dict[str, Any]] = {}
     max_displacement = 0.0
     entities = {entity.id: entity for entity in db.scalars(select(ParcelEntity).where(ParcelEntity.id.in_(parcel_ids)))}
-    links = list(db.scalars(select(ParcelSourceLink).where(ParcelSourceLink.parcel_entity_id.in_(parcel_ids))))
-    sources = {feature.id: feature for feature in db.scalars(select(SourceFeature).where(SourceFeature.id.in_([link.source_feature_id for link in links])))}
-    selections = {selection.parcel_entity_id: selection for selection in db.scalars(select(ParcelSelection).where(ParcelSelection.parcel_entity_id.in_(parcel_ids)))}
+    if len(entities) != len(set(parcel_ids)):
+        raise ValueError("Every parcel in a geometry measurement must exist")
+    before_shapes: dict[str, Any] = {}
     for parcel_id in parcel_ids:
-        geometry = None
-        selection = selections.get(parcel_id)
-        if selection and selection.geometry_source_id:
-            selected_source = db.get(SourceFeature, selection.geometry_source_id)
-            if selected_source and selected_source.normalized_geometry:
-                geometry = shape(selected_source.normalized_geometry)
+        geometry, origin = resolve_canonical_geometry(db, parcel_id)
         if geometry is not None:
-            chosen = analysis_crs_for(geometry)
-            before[parcel_id] = metric_geometry(geometry, chosen).area
+            before_shapes[parcel_id] = geometry
             before_geometries[parcel_id] = mapping(geometry)
+            before_origins[parcel_id] = origin or {}
     for draft_id, draft_data in draft_geometries.items():
         draft = shape(draft_data)
         check_coordinates(draft, True)
         if not draft.is_valid or draft.geom_type not in {"Polygon", "MultiPolygon"}:
             raise ValueError(f"Draft geometry for {draft_id} must be a valid polygon")
-        chosen = analysis_crs_for(draft)
-        after[draft_id] = metric_geometry(draft, chosen).area
-        if draft_id in before_geometries:
-            baseline = shape(before_geometries[draft_id])
-            max_displacement = max(max_displacement, metric_geometry(baseline, chosen).hausdorff_distance(metric_geometry(draft, chosen)))
+        after[draft_id] = draft.area
+    all_geometries = [*before_shapes.values(), *(shape(data) for data in draft_geometries.values())]
+    analysis_crs = analysis_crs_for(all_geometries[0]) if all_geometries else None
+    if analysis_crs:
+        before = {parcel_id: metric_geometry(geometry, analysis_crs).area for parcel_id, geometry in before_shapes.items()}
+        after = {draft_id: metric_geometry(shape(data), analysis_crs).area for draft_id, data in draft_geometries.items()}
+        for draft_id, draft_data in draft_geometries.items():
+            if draft_id in before_shapes:
+                baseline = metric_geometry(before_shapes[draft_id], analysis_crs)
+                max_displacement = max(max_displacement,
+                                       baseline.hausdorff_distance(metric_geometry(shape(draft_data), analysis_crs)))
     return {"before_area_m2": before, "after_area_m2": after, "before_geometries": before_geometries,
+            "before_origins": before_origins,
             "area_delta_m2": sum(after.values()) - sum(before.values()),
             "area_conservation_delta_m2": sum(after.values()) - sum(before.values()),
             "max_displacement_m": max_displacement,
-            "analysis_crs": sorted({analysis_crs_for(shape(geometry)) for geometry in draft_geometries.values()})}
+            "analysis_crs": analysis_crs}
 
 
 def feature_vector(evidence: dict[str, Any]) -> dict[str, float]:

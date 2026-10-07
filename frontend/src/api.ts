@@ -43,3 +43,9 @@ export async function downloadExport(projectId: string, kind: ExportKind, versio
   anchor.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
+
+export async function rasterPreview(projectId: string, assetId: string): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/projects/${projectId}/raster-assets/${assetId}/preview`, { headers: authorizedHeaders({}) })
+  if (!response.ok) throw await responseError(response)
+  return URL.createObjectURL(await response.blob())
+}

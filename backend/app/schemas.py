@@ -146,6 +146,10 @@ class ReconciliationDecision(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
     expected_revision: int = Field(ge=1)
     overrides: dict[str, Any] = Field(default_factory=dict)
+    geometry_source_id: str | None = None
+    attribute_source_id: str | None = None
+    attribute_sources: dict[str, str] = Field(default_factory=dict)
+    approve_selection: bool = False
 
 
 class GeometryChangeSetRequest(BaseModel):
@@ -202,11 +206,21 @@ class RankerTrainRequest(BaseModel):
     version: str = "ranker-v1"
 
 
+class RankerActivationRequest(BaseModel):
+    active: bool
+
+
 class AssignmentRequest(BaseModel):
     assignee_id: str
     parcel_entity_ids: list[str] = Field(min_length=1, max_length=500)
     expires_at: datetime | None = None
     reference_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssignmentUpdateRequest(BaseModel):
+    status: Literal["assigned", "active", "revoked"] | None = None
+    expires_at: datetime | None = None
+    expected_revision: int = Field(ge=1)
 
 
 class FieldEvidenceRequest(BaseModel):
@@ -219,6 +233,14 @@ class FieldEvidenceRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(default=100, ge=1, le=500)
+    offset: int = Field(default=0, ge=0, le=100000)
+    ward: str | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    radius_m: float | None = Field(default=None, gt=0, le=10000)
 
 
 class ComplianceRuleRequest(BaseModel):
@@ -256,7 +278,18 @@ class CitizenGrantRequest(BaseModel):
     expires_at: datetime | None = None
 
 
+class CitizenGrantUpdateRequest(BaseModel):
+    status: Literal["active", "revoked"] | None = None
+    fields: list[str] | None = None
+    expires_at: datetime | None = None
+
+
 class CitizenCaseRequest(BaseModel):
     parcel_entity_id: str
     category: Literal["evidence", "discrepancy", "dispute", "status"]
     description: str = Field(min_length=1, max_length=4000)
+
+
+class CitizenCaseResponseRequest(BaseModel):
+    response: str = Field(min_length=1, max_length=4000)
+    status: Literal["in_review", "resolved", "closed"] = "resolved"

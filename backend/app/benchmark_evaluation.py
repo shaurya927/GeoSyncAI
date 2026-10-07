@@ -40,7 +40,7 @@ def run(output, count):
                       'recorded_area': 'area_sq_m' if name == 'alternate' else 'recorded_area',
                       'area_units': 'units' if name == 'alternate' else 'area_units'}
             call('post',base+f"/datasets/{dataset['id']}/mapping",json={'mapping':fields,'confirm':True})
-            features[name] = {f['id']:f for f in call('get',base+f"/datasets/{dataset['id']}/features")}
+            features[name] = {f['id']:f for f in call('get',base+f"/datasets/{dataset['id']}/features?limit=1000")}
         elapsed['ingestion_mapping'] = time.perf_counter()-start
         stage = time.perf_counter()
         result = call('post',base+'/match',json={'left_dataset_id':datasets['reference']['id'],'right_dataset_id':datasets['alternate']['id']})
@@ -114,9 +114,16 @@ def run(output, count):
         lineage_complete = sum(bool(f['properties']['_lineage']['sources'] and f['properties']['_lineage']['review_decisions'] and
                               all(s['schema_mapping_id'] and s['crs_transformation'] and s['sha256'] for s in f['properties']['_lineage']['sources'])) for f in exported)
         elapsed['review_validation_publication_subset'] = time.perf_counter()-stage
+    dependency_names = ['fastapi', 'sqlalchemy', 'shapely', 'pyproj', 'fiona', 'rasterio']
+    dependencies = {}
+    for dependency in dependency_names:
+        try:
+            dependencies[dependency] = version(dependency)
+        except Exception:
+            dependencies[dependency] = None
     return {'generator_version':'pack-v2','measured_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
             'hardware':{'platform':platform.platform(),'processor':platform.processor(),'logical_cpus':os.cpu_count()},
-            'dependencies':{p:version(p) for p in ['fastapi','sqlalchemy','shapely','pyproj','fiona']},'python':platform.python_version(),
+             'dependencies': dependencies, 'python':platform.python_version(),
             'input_checksums':truth['checksums'],'feature_counts':truth['counts'],
             'vertex_counts':{filename: sum(vertex_count(feature['geometry'].get('coordinates', [])) for feature in json.loads((output/'inputs'/filename).read_text())['features']) for filename in truth['counts']},
             'stage_seconds':{k:round(v,4) for k,v in elapsed.items()},'total_seconds':round(time.perf_counter()-start,4),
