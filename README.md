@@ -181,7 +181,7 @@ review. The exact browser acceptance demonstration is automated in `e2e/test_bro
 # From repository root, in the Linux Python environment:
 python -m pytest backend/tests -q
 python -m playwright install --with-deps chromium
-python -m pytest e2e -q
+python -m pytest e2e/test_browser.py -q
 
 # Production-built Compose/Nginx Chromium smoke (with the disposable stack running)
 BASE_URL=http://127.0.0.1:5173 python -m pytest e2e/test_production_compose.py -q
@@ -190,7 +190,7 @@ BASE_URL=http://127.0.0.1:5173 python -m pytest e2e/test_production_compose.py -
 TEST_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST/TEST_DB \
 BROKER_TEST_URL=redis://HOST:6379/15 python -m pytest backend/tests -q
 E2E_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST/TEST_DB \
-python -m pytest e2e -q
+python -m pytest e2e/test_browser.py -q
 
 npm --prefix frontend run typecheck
 npm --prefix frontend run build
@@ -204,6 +204,9 @@ PYTHONPATH=backend python -m app.benchmark_evaluation --output /tmp/geosyncai-be
 ```
 
 Tests use new temporary SQLite databases and do not delete existing project data.
+The Acceptance workflow runs the isolated officer test first, then builds and
+starts a fresh Compose stack, waits for readiness, seeds its demo accounts, and
+runs the production Nginx smoke. The production test requires that running stack.
 PostGIS tests use the explicitly supplied test database; do not point them at
 production. Browser tests allocate free ports, run real services, and stop only
 their own processes. See [verification results](docs/VERIFICATION.md) and

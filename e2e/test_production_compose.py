@@ -26,11 +26,11 @@ def test_production_nginx_role_scoped_workspace():
         expect(page.get_by_role("button", name="Read-only queries", exact=True)).to_be_visible()
         expect(page.get_by_role("button", name="Compliance screening", exact=True)).to_be_visible()
         page.get_by_role("button", name="Boundary editor", exact=True).click()
-        expect(page.get_by_role("heading", name="Boundary editor", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="Boundary editor", exact=True, level=1)).to_be_visible()
         page.get_by_role("button", name="Read-only queries", exact=True).click()
         expect(page.get_by_role("heading", name="Read-only query workspace", exact=True)).to_be_visible()
         page.get_by_role("button", name="Compliance screening", exact=True).click()
-        expect(page.get_by_role("heading", name="Compliance screening", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="Compliance screening", exact=True, level=1)).to_be_visible()
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert not errors, errors

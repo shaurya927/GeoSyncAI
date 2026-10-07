@@ -1,6 +1,6 @@
 """Real browser + real HTTP API, isolated data and free loopback ports.
 
-Run: python -m pytest e2e -q (install playwright and its Chromium first).
+Run: python -m pytest e2e/test_browser.py -q (install playwright and its Chromium first).
 Only processes created by this test are terminated.
 """
 import base64
