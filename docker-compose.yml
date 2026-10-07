@@ -63,6 +63,7 @@ services:
       context: ./frontend
       args:
         VITE_API_BASE_URL: /api
+        VITE_CARTO_BASEMAP_KEY: ${VITE_CARTO_BASEMAP_KEY:-}
     ports: ["5173:80"]
     depends_on:
       api:

@@ -51,6 +51,28 @@ explicit source choices, draw a cut, approve split/merge, validate and publish.
 Use the production launcher for offline reload tests; the Vite development server
 does not register the production service worker.
 
+### Basemap and API keys
+
+The default map uses standard OpenStreetMap raster tiles without an API key.
+Tiles are for normal online interactive viewing, with visible OpenStreetMap
+attribution and the browser's normal HTTP caching. There is no offline tile
+download or bulk prefetch. The public service has no availability guarantee;
+use a suitable hosted or self-hosted provider for heavier deployment.
+See the [OpenStreetMap tile policy](https://operations.osmfoundation.org/policies/tiles/).
+
+CARTO now requires a basemap key; anonymous requests can return an "API KEY
+REQUIRED" watermark even with HTTP 200. To retain CARTO's light background,
+request a key from [CARTO](https://carto.com/basemaps/apikey) and set
+`VITE_CARTO_BASEMAP_KEY` in `frontend/.env` for local Vite builds, in the root
+`.env` for Compose builds, or in the frontend build environment. Restart Vite or
+rebuild the production frontend/Compose image after changing it. This is a public
+browser key, so restrict it to your allowed domains; never use a server secret.
+An empty value selects OpenStreetMap and never makes anonymous CARTO requests.
+
+No external AI API is used by the implemented matching/ranking or structured
+Hindi/English query parser. `JWT_SECRET` and `POSTGRES_PASSWORD` are separate
+self-generated deployment credentials, not third-party API keys.
+
 ## Linux / WSL startup
 
 Use Python **3.12** and Node **22**. Python packages are pinned in

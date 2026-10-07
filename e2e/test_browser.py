@@ -11,8 +11,10 @@ import socket
 import subprocess
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
+import pytest
 from playwright.sync_api import sync_playwright, expect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,12 +38,14 @@ def wait_for(url, process):
     raise RuntimeError(f'Readiness timed out: {url}')
 
 
-def test_browser_officer_workflow(tmp_path):
+@pytest.mark.parametrize('carto_key', ['', 'isolated-browser-key?&='])
+def test_browser_officer_workflow(tmp_path, carto_key):
     api_port, web_port = free_port(), free_port()
     env = {**os.environ, 'DATABASE_URL': os.environ.get('E2E_DATABASE_URL', f'sqlite:///{tmp_path / "browser.db"}'),
            'STORAGE_DIR': str(tmp_path / 'storage'), 'AUTO_BOOTSTRAP': 'true',
            'JWT_SECRET': 'isolated-browser-test-secret-at-least-32', 'CELERY_BROKER_URL': '',
-           'VITE_API_BASE_URL': f'http://127.0.0.1:{api_port}/api'}
+           'VITE_API_BASE_URL': f'http://127.0.0.1:{api_port}/api',
+           'VITE_CARTO_BASEMAP_KEY': carto_key}
     processes = []
     with (tmp_path / 'api.log').open('w') as api_log, (tmp_path / 'web.log').open('w') as web_log:
         try:
@@ -70,6 +74,7 @@ def test_browser_officer_workflow(tmp_path):
                     else:
                         route.fulfill(status=200, content_type='image/png', body=tile)
                 page.route('https://basemaps.cartocdn.com/**', serve_tile)
+                page.route('https://tile.openstreetmap.org/**', serve_tile)
                 page.goto(f'http://127.0.0.1:{web_port}', wait_until='domcontentloaded')
                 page.get_by_label('Username', exact=True).fill('admin')
                 page.get_by_label('Password', exact=True).fill('admin')
@@ -102,8 +107,18 @@ def test_browser_officer_workflow(tmp_path):
                 expect(page.get_by_text('Processing completed', exact=True)).to_be_visible(timeout=30000)
                 page.get_by_role('button', name='Review queue', exact=True).click()
                 expect(page.get_by_label('Show basemap')).to_be_checked()
-                expect(page.get_by_text('Basemap loaded', exact=True)).to_be_visible()
+                basemap_status = f'Basemap tiles received · {"CARTO" if carto_key else "OpenStreetMap"}'
+                expect(page.get_by_text(basemap_status, exact=True)).to_be_visible()
                 assert tile_requests, 'Basemap must request tiles on first opening'
+                for tile_url in tile_requests:
+                    parsed_url = urlsplit(tile_url)
+                    assert parsed_url.hostname == ('basemaps.cartocdn.com' if carto_key else 'tile.openstreetmap.org')
+                    if carto_key:
+                        assert parsed_url.path.startswith('/rastertiles/light_all/')
+                        assert parse_qs(parsed_url.query) == {'key': [carto_key]}
+                    else:
+                        assert not parsed_url.query, 'Default basemap must not depend on an API key'
+                expect(page.locator('.live-map .maplibregl-ctrl-attrib-inner').get_by_role('link', name='OpenStreetMap', exact=True)).to_be_visible()
                 expect(page.locator('.live-map canvas')).to_have_count(1)
                 page.get_by_label('Show basemap').uncheck()
                 expect(page.get_by_text('Basemap off · parcel overlays available', exact=True)).to_be_visible()
@@ -114,7 +129,7 @@ def test_browser_officer_workflow(tmp_path):
                 expect(page.locator('.live-map')).to_have_attribute('data-map-ready', 'true')
                 tile_state['fail'] = False
                 page.get_by_role('button', name='Retry map', exact=True).click()
-                expect(page.get_by_text('Basemap loaded', exact=True)).to_be_visible()
+                expect(page.get_by_text(basemap_status, exact=True)).to_be_visible()
                 expect(page.locator('.live-map canvas')).to_have_count(1)
                 # A rendered parcel must still be clickable after tile failure
                 # and map recreation; checking only a canvas misses blank maps.

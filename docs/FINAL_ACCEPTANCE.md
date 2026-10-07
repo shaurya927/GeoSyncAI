@@ -96,3 +96,34 @@ Compliance is screening assistance. Citizen access is explicit frozen grants.
 GNN research, government identity/records integrations, blockchain anchoring,
 photogrammetry, surveyed volumetric twins and capability-based AR are not claimed
 as implemented production integrations.
+
+## Basemap correction after provider verification
+
+The user reported an actual CARTO "API KEY REQUIRED" watermark on 7 October 2026.
+The previous browser suite replaced external tiles with PNG fixtures, so its pass
+verified map rendering/error recovery but did not establish anonymous CARTO service
+availability. CARTO's current documentation confirms that a basemap key is required.
+
+The default now uses standard OpenStreetMap tiles without a key. Supplying
+`VITE_CARTO_BASEMAP_KEY` selects CARTO's light raster tiles with a URL-encoded key.
+The setting reaches local builds and Docker/Compose builds. Attribution stays
+visible, and status says "Basemap tiles received" with the provider name rather
+than implying the provider's image content was validated. No tile prefetch or
+offline basemap download is implemented. README documents provider configuration
+and the OpenStreetMap tile usage policy.
+
+Fresh local checks for this correction:
+
+- Frontend typecheck/build and `git diff --check` passed.
+- `pytest e2e/test_browser.py e2e/test_submission_repairs.py -q`: **4 passed**,
+  40.45 s. The officer workflow now tests both the key-free default and an explicitly
+  configured CARTO key, including reserved-character encoding, visible attribution,
+  tile failure/retry, overlay selection, publication and responsive layout. External
+  tiles remain fixtures in automated viewport tests; no real CARTO key is supplied.
+- One identified, non-bulk request to the live OpenStreetMap world tile returned
+  HTTP 200, a 256×256 PNG, and normal caching headers. Visual inspection confirmed
+  that this real response has no API-key watermark.
+- The earlier repaired source revision `ba86665` passed the full GitHub Acceptance
+  workflow, including PostGIS/Redis, production repair browser tests, Compose startup
+  and Nginx smoke: https://github.com/shaurya927/GeoSyncAI/actions/runs/37611592002.
+  The basemap correction receives its own acceptance run when pushed.

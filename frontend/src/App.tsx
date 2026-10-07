@@ -7,6 +7,7 @@ import FieldworkPanel from './FieldworkPanel'
 import GeometryEditor from './GeometryEditor'
 import RegistryTools from './RegistryTools'
 import QueryPanel from './QueryPanel'
+import { BASEMAP } from './basemap'
 import { cachedSession, clearSession, saveSession, tokenExpiry, type Capabilities } from './session'
 
 type View = 'overview' | 'datasets' | 'review' | 'alerts' | 'versions' | 'fieldwork' | 'geometry' | 'queries' | 'compliance'
@@ -50,7 +51,7 @@ function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; se
     let observer: ResizeObserver | undefined
     setReadyMap(null); setMapError(''); setBasemapError(''); setBasemapLoaded(false)
     try {
-      instance = new maplibregl.Map({ container, center: [73, 20], zoom: 5,
+      instance = new maplibregl.Map({ container, center: [73, 20], zoom: 5, attributionControl: { compact: false },
         style: { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#e8efe9' } }] } })
       map.current = instance
       instance.addControl(new maplibregl.NavigationControl())
@@ -62,7 +63,7 @@ function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; se
         if (event.sourceId === 'basemap' && event.tile?.state === 'loaded') setBasemapLoaded(true)
       })
       instance.on('error', event => {
-        if (('sourceId' in event && event.sourceId === 'basemap') || event.error.message.includes('basemaps.cartocdn.com')) {
+        if (('sourceId' in event && event.sourceId === 'basemap') || event.error.message.includes(BASEMAP.host)) {
           if (basemapEnabled.current) setBasemapError('Basemap tiles could not load. Check your connection or turn off the basemap; parcel overlays remain available.')
         } else setMapError(`Map could not render: ${event.error.message}`)
       })
@@ -116,8 +117,8 @@ function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; se
     const instance = readyMap
     if (!instance || instance !== map.current) return
     if (basemap && !instance.getSource('basemap')) {
-      instance.addSource('basemap', { type: 'raster', tiles: ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'],
-        tileSize: 256, maxzoom: 20, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · © <a href="https://carto.com/attributions">CARTO</a>' })
+      instance.addSource('basemap', { type: 'raster', tiles: [BASEMAP.tileUrl],
+        tileSize: 256, maxzoom: BASEMAP.maxzoom, attribution: BASEMAP.attribution })
       instance.addLayer({ id: 'basemap', type: 'raster', source: 'basemap' }, instance.getLayer('parcel-fill') ? 'parcel-fill' : undefined)
     }
     if (instance.getLayer('basemap')) instance.setLayoutProperty('basemap', 'visibility', basemap ? 'visible' : 'none')
@@ -137,7 +138,7 @@ function ParcelMap({ features, selected, onSelect }: { features: w.Feature[]; se
     {!spatialCount && <p className="map-empty">No normalized parcel geometry yet. Upload spatial data and confirm its CRS in Datasets.</p>}
     {spatialCount > 0 && !visibleCount && <p className="map-empty">All source layers are hidden. Turn on a source layer to display its parcels.</p>}
     <div ref={host} className="parcel-map-canvas" role="region" aria-label="Parcel map" />
-    {!mapError && <p className="map-status" role="status">{!ready ? 'Loading map…' : !basemap ? 'Basemap off · parcel overlays available' : basemapError ? 'Parcel overlays available' : basemapLoaded ? 'Basemap loaded' : 'Loading basemap…'}</p>}
+    {!mapError && <p className="map-status" role="status">{!ready ? 'Loading map…' : !basemap ? 'Basemap off · parcel overlays available' : basemapError ? 'Parcel overlays available' : basemapLoaded ? `Basemap tiles received · ${BASEMAP.name}` : 'Loading basemap…'}</p>}
      <div className="map-legend-static">Green: normalized source · Amber: baseline/before · Blue: comparison/after · 3D uses only height_m with source and vertical reference.</div></section>
 }
 
