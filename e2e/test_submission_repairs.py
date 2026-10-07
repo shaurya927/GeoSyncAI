@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.client import HTTPConnection
 from pathlib import Path
 
 import httpx
@@ -33,7 +34,6 @@ def stack(tmp_path_factory):
     log = (workspace/"api.log").open("w")
     process = subprocess.Popen([sys.executable,"-m","uvicorn","app.main:app","--host","127.0.0.1","--port",str(api_port)],cwd=ROOT/"backend",env=env,stdout=log,stderr=subprocess.STDOUT)
     api = httpx.Client(base_url=f"http://127.0.0.1:{api_port}",timeout=30)
-    proxy = httpx.Client(base_url=f"http://127.0.0.1:{api_port}",timeout=30)
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(ROOT/"frontend"/"dist"),**kwargs)
         def end_headers(self):
@@ -43,11 +43,20 @@ def stack(tmp_path_factory):
                 self.send_header('X-Frame-Options', 'DENY')
             super().end_headers()
         def forward(self):
-            response = proxy.request(self.command,self.path,content=self.rfile.read(int(self.headers.get("Content-Length","0"))),headers={key:value for key,value in self.headers.items() if key.lower() in {"authorization","content-type"}})
-            self.send_response(response.status_code)
-            for key,value in response.headers.items():
-                if key.lower() not in {"content-length","transfer-encoding","content-encoding"}: self.send_header(key,value)
-            self.send_header("Content-Length",str(len(response.content))); self.end_headers(); self.wfile.write(response.content)
+            if not self.path.startswith('/api/'):
+                self.send_error(404); return
+            # The destination is a fixed loopback service, never a client URL.
+            # HTTPConnection also never follows a returned redirect.
+            connection = HTTPConnection('127.0.0.1', api_port, timeout=30)
+            try:
+                connection.request(self.command, self.path, body=self.rfile.read(int(self.headers.get('Content-Length','0'))),
+                                   headers={key:value for key,value in self.headers.items() if key.lower() in {'authorization','content-type'}})
+                response = connection.getresponse(); body = response.read()
+                self.send_response(response.status)
+                for key,value in response.getheaders():
+                    if key.lower() not in {'content-length','transfer-encoding','content-encoding'}: self.send_header(key,value)
+                self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+            finally: connection.close()
         def do_GET(self):
             if self.path.startswith("/api/"): self.forward()
             else: super().do_GET()
@@ -70,7 +79,7 @@ def stack(tmp_path_factory):
         yield api,f"http://127.0.0.1:{server.server_port}",workspace
     finally:
         if server: server.shutdown(); server.server_close()
-        proxy.close(); api.close(); process.terminate(); process.wait(timeout=15); log.close()
+        api.close(); process.terminate(); process.wait(timeout=15); log.close()
 
 
 @pytest.fixture

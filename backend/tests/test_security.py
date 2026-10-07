@@ -205,6 +205,29 @@ def test_archive_and_record_limits(monkeypatch):
     with pytest.raises(ValueError,match='list'): _parse_geojson(b'{"type":"FeatureCollection","features":1}')
 
 
+def test_query_parser_bounds_and_repeated_hindi_keywords():
+    from app.advanced import parse_structured_query
+    assert parse_structured_query('लिंक उपलब्ध नहीं हैं')['kind'] == 'missing_links'
+    assert parse_structured_query('लिंक' * 100)['kind'] == 'help'
+    with pytest.raises(ValueError, match='500-character'):
+        parse_structured_query('लिंक' * 10000)
+
+
+def test_native_parser_errors_do_not_leak_in_api_or_retained_reports(client, auth_token, monkeypatch):
+    from app import services
+    private_detail = '/private/geosyncai/grid/secret.dat: native library internals'
+    def broken_parser(*args): raise ValueError(private_detail)
+    monkeypatch.setattr(services, 'parse_features', broken_parser)
+    headers = {'Authorization': 'Bearer ' + auth_token('admin')}
+    project = client.post('/api/projects', headers=headers, json={'name': 'Parser redaction regression'}).json()['id']
+    rejected = client.post(f'/api/projects/{project}/datasets/upload', headers=headers,
+                           files={'file': ('invalid.geojson', b'{}', 'application/geo+json')})
+    assert rejected.status_code == 422 and private_detail not in rejected.text
+    datasets = client.get(f'/api/projects/{project}/datasets', headers=headers)
+    assert datasets.status_code == 200 and private_detail not in datasets.text
+    assert datasets.json()[0]['status'] == 'rejected'
+
+
 def test_redis_shared_atomic_budget():
     url=os.environ.get('BROKER_TEST_URL')
     if not url: pytest.skip('Redis service required for cross-worker atomic traffic test')

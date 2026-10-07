@@ -182,8 +182,9 @@ def validate_project(db, project_id, actor_id):
             analysis_crs = analysis_crs or analysis_crs_for(geometry)
             geometries.append(metric_geometry(geometry, analysis_crs))
             parcel_ids.append(candidate["parcel_entity_id"])
-        except ValueError as exc:
-            failures.append({"parcel_entity_id": candidate["parcel_entity_id"], "reason": str(exc)})
+        except ValueError:
+            failures.append({"parcel_entity_id": candidate["parcel_entity_id"],
+                             "reason": "Candidate measurement failed. Check geometry, CRS and units."})
     tree = STRtree(geometries)
     neighborhoods = []
     for i, geometry in enumerate(geometries):

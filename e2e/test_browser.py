@@ -13,6 +13,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
+from uuid import uuid4
 
 import pytest
 from playwright.sync_api import sync_playwright, expect
@@ -80,10 +81,12 @@ def test_browser_officer_workflow(tmp_path, carto_key):
                 page.get_by_label('Username', exact=True).fill('admin')
                 page.get_by_label('Password', exact=True).fill('admin')
                 page.get_by_role('button', name='Sign in to workspace').click()
-                page.get_by_label('Project name').fill('Browser acceptance project')
+                project_name = 'Browser acceptance project ' + uuid4().hex[:8]
+                page.get_by_label('Project name').fill(project_name)
                 page.get_by_role('button', name='Create project', exact=True).click()
-                expect(page.get_by_label('Project', exact=True)).to_have_value(__import__('re').compile('.+'))
+                expect(page.get_by_label('Project', exact=True).locator('option:checked')).to_have_text(project_name)
                 page.get_by_role('button', name='Datasets', exact=True).click()
+                expect(page.get_by_role('button', name='Upload dataset', exact=True)).to_be_enabled()
                 geometry = {'type': 'Polygon', 'coordinates': [[[73,20],[73.001,20],[73.001,20.001],[73,20.001],[73,20]]]}
                 body = json.dumps({'type': 'FeatureCollection', 'features': [{'type': 'Feature', 'id': '0001',
                     'properties': {'parcel_id': '0001', 'village_code': 'TEST'}, 'geometry': geometry}]}).encode()

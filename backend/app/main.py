@@ -377,7 +377,7 @@ def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: UploadFile 
     try:
         report = ingest_dataset(db, dataset, data, file.filename, file.content_type)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail="Source ingestion failed. Check format, record limits, archive safety and CRS.") from exc
     audit(db, "dataset_uploaded", user.id, project_id, "dataset", dataset.id,
           {"content_hash": dataset.content_hash, "record_count": dataset.record_count})
     db.commit()
@@ -631,7 +631,7 @@ def confirm_crs(project_id: str, dataset_id: str, payload: CRSConfirmation, db: 
     try:
         report = confirm_dataset_crs(db, dataset, payload.crs, user.id, payload.reason)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail="CRS confirmation failed. Check the definition, coordinate ranges and reviewed links.") from exc
     return {**dataset_response(dataset), "validation_report": report}
 
 

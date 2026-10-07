@@ -196,7 +196,7 @@ def _parse_vector_with_fiona(path: Path, layer: str | None = None) -> tuple[list
                                  "geometry": item.get("geometry")})
             return features, crs
     except Exception as exc:
-        raise ValueError(f"Could not read vector dataset: {exc}") from exc
+        raise ValueError("Could not read vector dataset. Check its format and required companion files.") from exc
 
 
 def _parse_shapefile_zip(data: bytes) -> tuple[list[dict[str, Any]], str | None]:
@@ -243,7 +243,7 @@ def _parse_geopackage(data: bytes, filename: str | None) -> tuple[list[dict[str,
         except ImportError as exc:
             raise ValueError("GeoPackage uploads require the Fiona dependency") from exc
         except Exception as exc:
-            raise ValueError(f"Could not inspect GeoPackage layers: {exc}") from exc
+            raise ValueError("Could not inspect GeoPackage layers. Check the file format and layer structure.") from exc
         if not layers:
             raise ValueError("GeoPackage contains no readable layers")
         return _parse_vector_with_fiona(path, layer=layers[0])
@@ -332,10 +332,10 @@ def ingest_dataset(db: Session, dataset: Dataset, data: bytes, filename: str | N
         features, embedded_crs, file_format = parse_features(data, filename, mime_type)
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         dataset.status = "rejected"
-        report["errors"].append(str(exc))
+        report["errors"].append("Source parsing failed. Check format, record limits and archive safety.")
         dataset.validation_report = report
         db.commit()
-        raise ValueError(str(exc)) from exc
+        raise ValueError("Source parsing failed. Check format, record limits and archive safety.") from exc
     report["format"] = file_format
     dataset.declared_crs = dataset.declared_crs or embedded_crs
     dataset.record_count = len(features)
@@ -358,8 +358,8 @@ def ingest_dataset(db: Session, dataset: Dataset, data: bytes, filename: str | N
     if dataset.declared_crs:
         try:
             CRS.from_user_input(dataset.declared_crs)
-        except Exception as exc:
-            crs_error = f"Invalid CRS definition: {dataset.declared_crs}: {exc}"
+        except Exception:
+            crs_error = "Invalid CRS definition. Confirm the source coordinate reference system."
             report["errors"].append(crs_error)
     for i, item in enumerate(features):
         original_id = str(item.get("id")) if item.get("id") is not None else None
@@ -413,9 +413,9 @@ def ingest_dataset(db: Session, dataset: Dataset, data: bytes, filename: str | N
                 geom, feature_crs = normalize_geometry(geom, dataset.declared_crs)
                 normalized_crs = feature_crs or normalized_crs
                 geometries.append(geom)
-            except Exception as exc:
+            except Exception:
                 status = "quarantined"
-                reason = f"CRS transformation failed: {exc}"
+                reason = "CRS transformation failed. Check source CRS and coordinate ranges."
                 report["errors"].append(reason)
             if status == "processed" and not geom.is_valid:
                 report["invalid_geometry"].append({"index": i, "reason": explain_validity(geom)})
@@ -518,9 +518,9 @@ def confirm_dataset_crs(db: Session, dataset: Dataset, crs: str, actor_id: str, 
                 feature.spatial_geometry = spatial_column(normalized, normalized_crs).get("spatial_geometry")
             geometries.append(normalized)
             report["processed"] += 1
-        except Exception as exc:
+        except Exception:
             feature.status = "quarantined"
-            feature.processing_reason = f"CRS transformation failed: {exc}"
+            feature.processing_reason = "CRS transformation failed. Check source CRS and coordinate ranges."
             report["errors"].append(feature.processing_reason)
             report["quarantined"] += 1
 

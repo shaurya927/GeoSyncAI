@@ -414,6 +414,8 @@ def train_ranker(db: Session, project_id: str, actor_id: str, seed: int, version
 
 
 def parse_structured_query(query: str) -> dict[str, Any]:
+    if len(query) > 500:
+        raise ValueError('Spatial query exceeds the 500-character limit')
     normalized = " ".join(query.casefold().split())
     result: dict[str, Any] = {"kind": "help", "filters": {}, "limit": 100}
     if re.search(r"conflict|विवाद", normalized):
@@ -421,7 +423,8 @@ def parse_structured_query(query: str) -> dict[str, Any]:
         ward = re.search(r"(?:ward|वार्ड)\s*[:=]?\s*([\w-]+)", normalized)
         if ward:
             result["filters"]["ward"] = ward.group(1)
-    elif re.search(r"missing\s+(?:link|links)|लिंक.*नहीं|unmatched", normalized):
+    elif (re.search(r"missing\s+links?|unmatched", normalized)
+          or ('लिंक' in normalized and 'नहीं' in normalized[normalized.find('लिंक') + len('लिंक'):])):
         result["kind"] = "missing_links"
     elif re.search(r"area|क्षेत्रफल", normalized):
         result["kind"] = "area_threshold"
