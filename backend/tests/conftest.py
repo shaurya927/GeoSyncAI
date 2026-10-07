@@ -10,6 +10,9 @@ os.environ["STORAGE_DIR"] = str(TEST_ROOT / "storage")
 os.environ["JWT_SECRET"] = "test-secret-longer-than-thirty-two-bytes"
 os.environ["AUTO_BOOTSTRAP"] = "true"
 os.environ['CELERY_BROKER_URL'] = ''
+# Large functional suite uses an isolated API. Traffic abuse is tested separately
+# with enabled policies and small limits, including Redis in service CI.
+os.environ['RATE_LIMIT_ENABLED'] = 'false'
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import pytest

@@ -45,6 +45,7 @@ def test_browser_officer_workflow(tmp_path, carto_key):
            'STORAGE_DIR': str(tmp_path / 'storage'), 'AUTO_BOOTSTRAP': 'true',
            'JWT_SECRET': 'isolated-browser-test-secret-at-least-32', 'CELERY_BROKER_URL': '',
            'VITE_API_BASE_URL': f'http://127.0.0.1:{api_port}/api',
+               'CORS_ORIGINS': json.dumps([f'http://127.0.0.1:{web_port}']),
            'VITE_CARTO_BASEMAP_KEY': carto_key}
     processes = []
     with (tmp_path / 'api.log').open('w') as api_log, (tmp_path / 'web.log').open('w') as web_log:

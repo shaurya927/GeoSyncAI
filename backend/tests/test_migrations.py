@@ -26,7 +26,9 @@ from app.models import User, Project
 from sqlalchemy import text
 with SessionLocal() as db:
     assert db.get(User,'retained').username=='retained'
-    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0008_ranker_activation'
+    assert db.scalar(text('SELECT version_num FROM alembic_version'))=='0009_security_sessions'
+    assert db.get(User,'retained').auth_version==0
+    assert db.execute(text('SELECT jti FROM revoked_tokens')).all()==[]
     assert db.execute(text('SELECT workflow_revision,validated_revision FROM projects')).all()==[]
 """
     subprocess.run([sys.executable, '-c', check], env=env, cwd=root, check=True)

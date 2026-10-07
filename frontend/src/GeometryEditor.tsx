@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import maplibregl from 'maplibre-gl'
+import * as maplibregl from './maplibre'
 import * as w from './workflowApi'
 
 type Geometries = Record<string, GeoJSON.Geometry>

@@ -3,6 +3,7 @@ import hmac
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
+from uuid import uuid4
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -10,22 +11,23 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import get_settings
 from .db import get_db
-from .models import Project, ProjectMember, User
+from .models import Project, ProjectMember, User, RevokedToken
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 ROLES = {"viewer", "processor", "reviewer", "steward", "field", "citizen", "admin"}
+PASSWORD_ROUNDS = 600_000
 
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 210_000)
-    return f"pbkdf2_sha256$210000${salt.hex()}${digest.hex()}"
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ROUNDS)
+    return f"pbkdf2_sha256${PASSWORD_ROUNDS}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, rounds, salt_hex, digest_hex = encoded.split("$")
-        if algorithm != "pbkdf2_sha256":
+        if algorithm != "pbkdf2_sha256" or not 10_000 <= int(rounds) <= 2_000_000 or len(password.encode()) > 1024:
             return False
         actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds))
         return hmac.compare_digest(actual.hex(), digest_hex)
@@ -33,11 +35,32 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
+DUMMY_PASSWORD_HASH = hash_password("unusable-random-login-" + os.urandom(24).hex())
+
+
+def password_needs_rehash(encoded: str) -> bool:
+    return encoded.split("$")[1] != str(PASSWORD_ROUNDS)
+
+
+def decode_access_token(token: str) -> dict:
+    settings = get_settings()
+    if len(token) > 8192:
+        raise jwt.InvalidTokenError("Token too long")
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"],
+                         issuer=settings.jwt_issuer, audience=settings.jwt_audience,
+                         options={"require": ["sub", "exp", "iat", "nbf", "iss", "aud", "jti", "sv"]})
+    if type(payload["sv"]) is not int or not isinstance(payload["jti"], str) or len(payload["jti"]) != 36:
+        raise jwt.InvalidTokenError("Invalid session claims")
+    return payload
+
+
 def create_access_token(user: User) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     payload = {"sub": user.id, "username": user.username, "role": user.role,
-               "iat": now, "exp": now + timedelta(minutes=settings.jwt_expire_minutes)}
+               "iat": now, "nbf": now, "exp": now + timedelta(minutes=settings.jwt_expire_minutes),
+               "iss": settings.jwt_issuer, "aud": settings.jwt_audience,
+               "jti": str(uuid4()), "sv": user.auth_version}
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
@@ -45,12 +68,12 @@ def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: Annotate
     credentials_error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials",
                                       headers={"WWW-Authenticate": "Bearer"})
     try:
-        payload = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"])
+        payload = decode_access_token(token)
         user_id = payload.get("sub")
     except jwt.PyJWTError as exc:
         raise credentials_error from exc
     user = db.get(User, user_id) if user_id else None
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.auth_version != payload["sv"] or db.get(RevokedToken, payload["jti"]):
         raise credentials_error
     return user
 

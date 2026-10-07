@@ -16,6 +16,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from app.security import WEB_CSP
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,9 +62,30 @@ def main():
     stop_token = secrets.token_urlsafe(32)
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *params, **kwargs): super().__init__(*params, directory=str(ROOT / "frontend" / "dist"), **kwargs)
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(30)
+        def end_headers(self):
+            if not self.path.startswith('/api/'):
+                self.send_header('Content-Security-Policy', WEB_CSP)
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
+                self.send_header('Permissions-Policy', 'geolocation=(self), camera=(self), microphone=()')
+            super().end_headers()
         def forward(self):
+            lengths = self.headers.get_all('Content-Length', [])
+            if len(lengths) > 1 or (lengths and not lengths[0].isdigit()) or self.headers.get('Transfer-Encoding'):
+                self.send_error(400, 'Invalid request framing'); self.close_connection = True; return
+            size = int(lengths[0]) if lengths else 0
+            limit = (int(env.get('MAX_UPLOAD_BYTES', 250 * 1024 * 1024)) + 65536
+                     if self.path.endswith('/upload') else int(env.get('MAX_JSON_BODY_BYTES', 2 * 1024 * 1024)))
+            if size > limit:
+                self.send_error(413, 'Request body exceeds the configured limit'); self.close_connection = True; return
             headers = {key:value for key,value in self.headers.items() if key.lower() in {"authorization", "content-type"}}
-            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            body = self.rfile.read(size)
+            if len(body) != size:
+                self.send_error(400, 'Request body length mismatch'); self.close_connection = True; return
             request = Request(api_url + self.path, data=body if body else None, headers=headers, method=self.command)
             try:
                 response = urlopen(request, timeout=60)
@@ -90,7 +113,7 @@ def main():
         def do_DELETE(self): self.forward()
     with (data / "api.log").open("a", encoding="utf-8") as log:
         try:
-            process = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(api_port)], cwd=ROOT / "backend", env=env, stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(api_port), "--no-proxy-headers", "--no-access-log"], cwd=ROOT / "backend", env=env, stdout=log, stderr=subprocess.STDOUT)
             for _ in range(150):
                 if process.poll() is not None: raise RuntimeError(f"API exited; inspect {data/'api.log'}")
                 try:

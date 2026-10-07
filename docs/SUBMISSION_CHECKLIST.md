@@ -21,6 +21,7 @@ Multi-source Geospatial Data for Urban Land Record Management
 | Raster/3D | Genuine GeoTIFF metadata/preview and validated-height-only extrusion | rasterio container test; no surveyed volumetric twin claim |
 | Publication | Immutable candidate fingerprint, manifest/output/source hashes, lineage, exports and rollback verification | Current backend suite plus publication/browser path; service boundary in final acceptance |
 | Interoperability | Scoped OGC landing, conformance, collections, items, bbox, version and pagination | OGC backend tests |
+| Security and traffic | Revocable scoped sessions, stronger passwords, account administration, shared rate limits, request/queue caps, CSP, trusted proxy and non-root containers | Security API/browser regressions, dependency audit and service-stack CI; hosting boundaries in SECURITY.md |
 
 ## Demo path
 

@@ -115,6 +115,8 @@ def _parse_geojson(data: bytes) -> tuple[list[dict[str, Any]], str | None]:
     if doc.get("type") == "FeatureCollection":
         if not isinstance(doc.get("features"), list) or any(not isinstance(f, dict) for f in doc['features']):
             raise ValueError("GeoJSON features must be a list of objects")
+        if len(doc["features"]) > get_settings().max_source_records:
+            raise ValueError("Dataset exceeds the configured record limit")
         if any(f.get('properties') is not None and not isinstance(f.get('properties'), dict) for f in doc['features']):
             raise ValueError("Feature properties must be objects or null")
         crs = None
@@ -131,9 +133,11 @@ def _parse_geojson(data: bytes) -> tuple[list[dict[str, Any]], str | None]:
 
 def _parse_csv(data: bytes) -> tuple[list[dict[str, Any]], str | None]:
     text = data.decode("utf-8-sig")
-    rows = list(csv.DictReader(io.StringIO(text)))
+    rows = csv.DictReader(io.StringIO(text))
     features = []
     for row in rows:
+        if len(features) >= get_settings().max_source_records:
+            raise ValueError("Dataset exceeds the configured record limit")
         if None in row:
             raise ValueError("CSV record contains more columns than its header")
         clean = {str(k): _jsonable(v) for k, v in row.items() if k is not None}
@@ -186,6 +190,8 @@ def _parse_vector_with_fiona(path: Path, layer: str | None = None) -> tuple[list
             crs = _fiona_crs(collection)
             features = []
             for item in collection:
+                if len(features) >= get_settings().max_source_records:
+                    raise ValueError("Dataset exceeds the configured record limit")
                 features.append({"id": item.get("id"), "properties": dict(item.get("properties") or {}),
                                  "geometry": item.get("geometry")})
             return features, crs
@@ -207,7 +213,11 @@ def _parse_shapefile_zip(data: bytes) -> tuple[list[dict[str, Any]], str | None]
                 if any(member.is_dir() or Path(member.filename).is_absolute() or ".." in Path(member.filename).parts
                        or "\\" in member.filename or ":" in member.filename
                        or (member.external_attr >> 16) & 0o170000 == 0o120000
-                       or member.file_size > max(1, member.compress_size) * 1000 for member in members):
+                       or member.flag_bits & 1
+                       or member.file_size > settings.max_upload_bytes
+                       or member.file_size > max(1, member.compress_size) * settings.max_zip_compression_ratio
+                       or Path(member.filename).suffix.lower() not in {'.shp', '.shx', '.dbf', '.prj', '.cpg', '.qix', '.sbn', '.sbx', '.xml'}
+                       for member in members):
                     raise ValueError("Unsafe archive path; upload a flat SHP ZIP")
                 archive.extractall(root)
         except zipfile.BadZipFile as exc:

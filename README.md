@@ -137,6 +137,12 @@ checked; owning a project does not turn a processor into a reviewer.
 
 ## Docker Compose target
 
+Security and traffic controls are implemented in the API, browser and proxy.
+Use the **Security** tab to change a passphrase; administrators can create/disable
+accounts, revoke sessions and inspect limits. Connected sign-out revokes its token.
+See [SECURITY.md](SECURITY.md) for actual budgets, upgrade preservation and the
+production setup. Public hosting still requires TLS and tested infrastructure.
+
 The configuration includes frontend/Nginx, API, PostgreSQL/PostGIS, Redis, Celery
 worker, database/upload volumes, migrations and readiness checks.
 

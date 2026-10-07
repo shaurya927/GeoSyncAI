@@ -127,3 +127,46 @@ Fresh local checks for this correction:
   workflow, including PostGIS/Redis, production repair browser tests, Compose startup
   and Nginx smoke: https://github.com/shaurya927/GeoSyncAI/actions/runs/37611592002.
   The basemap correction receives its own acceptance run when pushed.
+
+## Security and traffic hardening — 7 October 2026
+
+Added current-account session checks, complete JWT claims, connected token logout,
+session invalidation after passphrase/access changes, 600,000-round password hashes
+with legacy upgrade, administrator account controls and a live traffic panel.
+Rate budgets, actual streamed body caps, timeouts, admission limits and serialized
+per-project queue capacity now bound work. Redis counters are atomic across API
+workers; native upload parsing runs outside the event loop. Restricted origins/hosts,
+CSP/headers, loopback ports, trusted proxy identity and non-root container restrictions
+protect the browser/deployment boundary. Archive and record caps were strengthened.
+
+Updated MapLibre to patched 6.13.0 and configured its Vite worker explicitly in both
+development/production. Updated pytest to 9.0.3 for its reported advisory. New account
+APIs/UI do not grant implicit project access. Migration 0009 preserves source records
+and existing accounts; old JWTs require a fresh login. See `SECURITY.md` for operational
+settings and the offline/hosting boundaries.
+
+Fresh local results on the security implementation:
+
+- Backend suite: **69 passed, 3 skipped**, 54.18 s. Skips require local PostGIS,
+  Redis/Celery and Redis atomic-counter services; these run in service CI.
+- Real HTTP browser journeys: **5 passed**, 63.73 s. Includes both basemap configurations,
+  normal geospatial publication, production offline/geometry workflows and a new
+  account creation/passphrase/disable/logout/session-revocation journey under CSP.
+- `npm audit --audit-level=high`: **0 known vulnerabilities**.
+- `pip-audit -r backend/requirements-dev.txt --no-deps --disable-pip`: **no known
+  vulnerabilities** in the pinned application/test requirements at check time.
+- Frontend build/typecheck, Ruff F and diff whitespace checks passed. The MapLibre
+  bundle retains the previously disclosed size warning.
+
+Acceptance CI now also verifies non-root API/worker identities, production Nginx
+headers, Redis-backed UI, token logout and a bounded burst against its disposable
+stack. Separate CodeQL analysis covers Python and JavaScript/TypeScript. These new
+service checks are pending the security revision's GitHub run; local evidence does
+not substitute for that result. The prior basemap revision `54e0191` passed
+Acceptance: https://github.com/shaurya927/GeoSyncAI/actions/runs/37621512066.
+
+These changes are tested protection controls, not a penetration-test certificate
+or a measured user-capacity claim. Public deployment still requires HTTPS, protected
+backups, storage monitoring, least-privilege database provisioning, host capacity
+testing and upstream DDoS protection. Offline storage is not encrypted and cannot
+learn revocation until reconnect. No public deployment or SIH submission occurred.

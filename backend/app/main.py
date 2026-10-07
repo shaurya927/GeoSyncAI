@@ -11,15 +11,16 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Annotated
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from .auth import (CurrentUser, ensure_project_access, ensure_project_membership, hash_password, verify_password,
-                   create_access_token, project_member, utc_expired, capability_allowed)
+                   create_access_token, project_member, utc_expired, capability_allowed, DUMMY_PASSWORD_HASH, password_needs_rehash)
 from .config import get_settings
 from .db import get_db, init_db
 from .models import (Dataset, Job, MatchProposal, Project, ProjectMember, ReviewDecision, SourceFeature,
@@ -46,6 +47,8 @@ from .querying import execute_query, readable_dataset_ids
 from .ground_control import fit_session, control_coverage
 from .geometry_editing import preview_geometry
 from .advanced import geometry_submission_gates
+from .security import SecurityMiddleware, TrafficGuard, TrafficUnavailable
+from .account_security import router as account_security_router
 
 
 DEMO_USERS = {"viewer": "viewer", "processor": "processor", "reviewer": "reviewer", "admin": "admin",
@@ -81,6 +84,18 @@ async def lifespan(_app: FastAPI):
         raise RuntimeError("Set JWT_SECRET to at least 32 random characters or explicitly enable DEMO_MODE")
     if settings.demo_mode and not settings.jwt_secret:
         settings.jwt_secret = "explicit-local-demo-only-secret-do-not-deploy"
+    if "*" in settings.allowed_hosts or "*" in settings.cors_origins:
+        raise RuntimeError("Configure explicit ALLOWED_HOSTS and CORS_ORIGINS; wildcards are forbidden")
+    if settings.production_mode:
+        if settings.demo_mode or settings.auto_bootstrap or not settings.rate_limit_enabled:
+            raise RuntimeError("Production requires traffic protection and disabled demo/auto-bootstrap modes")
+        if not (settings.security_redis_url or settings.celery_broker_url):
+            raise RuntimeError("Production requires Redis-backed shared traffic limits")
+        if any(not origin.startswith('https://') for origin in settings.cors_origins):
+            raise RuntimeError("Production CORS origins must use HTTPS, or an empty list for same-origin only")
+        if len(set(settings.jwt_secret)) < 12:
+            raise RuntimeError("Generate a random production JWT secret; repetitive values are rejected")
+        traffic_guard.store.client.ping()
     init_db()
     if get_settings().auto_bootstrap:
         db = next(get_db())
@@ -88,12 +103,27 @@ async def lifespan(_app: FastAPI):
             bootstrap(db)
         finally:
             db.close()
+    if settings.production_mode:
+        with next(get_db()) as db:
+            for username, password in DEMO_USERS.items():
+                account = db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
+                if account and verify_password(password, account.password_hash):
+                    raise RuntimeError("Disable or replace active demonstration passwords before production startup")
     recover_jobs()
     yield
 
 
-app = FastAPI(title="GeoSyncAI API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app_settings = get_settings()
+traffic_guard = TrafficGuard(app_settings)
+app = FastAPI(title="GeoSyncAI API", version="0.1.0", lifespan=lifespan,
+              docs_url="/docs" if app_settings.api_docs_enabled else None,
+              redoc_url=None, openapi_url="/openapi.json" if app_settings.api_docs_enabled else None)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=app_settings.allowed_hosts)
+app.add_middleware(SecurityMiddleware, guard=traffic_guard)
+app.add_middleware(CORSMiddleware, allow_origins=app_settings.cors_origins, allow_credentials=False,
+                   allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+                   allow_headers=["Authorization", "Content-Type"], expose_headers=["Retry-After", "X-Request-ID"])
+app.include_router(account_security_router)
 
 
 Db = Annotated[Session, Depends(get_db)]
@@ -119,10 +149,28 @@ def readiness(db: Db):
 
 
 @app.post("/api/auth/token", response_model=Token)
-def login(payload: LoginRequest, db: Db):
+def login(payload: LoginRequest, db: Db, request: Request):
+    if get_settings().rate_limit_enabled:
+        try:
+            allowed, retry = request.state.traffic_guard.consume("login-account", payload.username.casefold(),
+                get_settings().account_login_requests_per_window, get_settings().account_login_window_seconds)
+        except TrafficUnavailable as exc:
+            raise HTTPException(503, "Login protection temporarily unavailable", headers={"Retry-After": "5"}) from exc
+        if not allowed:
+            raise HTTPException(429, "Too many login attempts", headers={"Retry-After": str(retry)})
     user = db.scalar(select(User).where(User.username == payload.username))
-    if not user or not verify_password(payload.password, user.password_hash):
+    valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
+    if not user or not user.is_active or not valid:
+        audit(db, "authentication_failed", None, details={"request_id": request.state.request_id})
+        db.commit()
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if password_needs_rehash(user.password_hash):
+        changed = db.execute(update(User).where(User.id == user.id, User.auth_version == user.auth_version,
+            User.password_hash == user.password_hash).values(password_hash=hash_password(payload.password)))
+        if changed.rowcount != 1:
+            raise HTTPException(409, "Account changed; sign in again")
+    audit(db, "authentication_succeeded", user.id)
+    db.commit()
     return {"access_token": create_access_token(user), "user": {"id": user.id, "username": user.username, "role": user.role}}
 
 
@@ -286,7 +334,7 @@ def register_dataset(project_id: str, payload: DatasetRegister, db: Db, user: Cu
 
 
 @app.post("/api/projects/{project_id}/datasets/upload", status_code=201)
-async def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: UploadFile = File(...),
+def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: UploadFile = File(...),
                          name: str | None = Form(None), source_organization: str | None = Form(None),
                          capture_date: date | None = Form(None), declared_crs: str | None = Form(None),
                           parent_dataset_id: str | None = Form(None), license_classification: str | None = Form(None),
@@ -294,7 +342,9 @@ async def upload_dataset(project_id: str, db: Db, user: CurrentUser, file: Uploa
                           administrative_namespace: str | None = Form(None), access_classification: str = Form("internal"),
                           accuracy_metadata: str | None = Form(None), provenance: str | None = Form(None)):
     ensure_project_access(db, project_id, user, write=True)
-    data = await file.read(get_settings().max_upload_bytes + 1)
+    # Native format/geometry work belongs in FastAPI's bounded thread pool,
+    # leaving the event loop available to reject excess traffic and serve reads.
+    data = file.file.read(get_settings().max_upload_bytes + 1)
     if len(data) > get_settings().max_upload_bytes:
         raise HTTPException(status_code=413, detail=f"Upload exceeds the {get_settings().max_upload_bytes} byte limit")
     namespace = {}
@@ -381,14 +431,14 @@ def update_dataset_metadata(project_id: str, dataset_id: str, payload: DatasetMe
 
 
 @app.post("/api/projects/{project_id}/raster-assets", status_code=201)
-async def upload_raster_asset(project_id: str, db: Db, user: CurrentUser, file: UploadFile = File(...),
+def upload_raster_asset(project_id: str, db: Db, user: CurrentUser, file: UploadFile = File(...),
                               name: str | None = Form(None), source_crs: str | None = Form(None),
                               attribution: str | None = Form(None), access_classification: str = Form("internal"),
                               source_date: date | None = Form(None)):
     ensure_project_access(db, project_id, user, write=True)
     if access_classification not in {"public", "internal", "restricted"}:
         raise HTTPException(422, "Invalid raster access classification")
-    data = await file.read(get_settings().max_upload_bytes + 1)
+    data = file.file.read(get_settings().max_upload_bytes + 1)
     if len(data) > get_settings().max_upload_bytes:
         raise HTTPException(413, "Raster exceeds the configured upload limit")
     if data[:4] not in {b"II*\x00", b"MM\x00*"}:
@@ -2150,6 +2200,9 @@ def create_job(project_id: str, job_type: str, payload: dict, background: Backgr
             return job_response(existing)
     job = Job(project_id=project_id, job_type=job_type, payload=payload, created_by=user.id,
               idempotency_key=idempotency_key, max_attempts=get_settings().job_max_attempts)
+    existing = enforce_job_capacity(db, project_id, idempotency_key, configuration_hash)
+    if existing:
+        return job_response(existing)
     job.configuration_hash = configuration_hash
     db.add(job)
     try:
@@ -2174,6 +2227,7 @@ def retry_job(project_id: str, job_id: str, background: BackgroundTasks, db: Db,
         raise HTTPException(409, "Only failed jobs can be retried")
     if job.attempts >= job.max_attempts:
         raise HTTPException(409, "Job has exhausted its bounded retry attempts")
+    enforce_job_capacity(db, project_id)
     validate_job_payload(db, project_id, job.job_type, job.payload)
     ensure_readable_inputs(db, project_id, user, [value for key, value in job.payload.items() if key.endswith("dataset_id")])
     job.status = "queued"
@@ -2185,6 +2239,23 @@ def retry_job(project_id: str, job_id: str, background: BackgroundTasks, db: Db,
     db.commit()
     dispatch_job(job_id, background)
     return job_response(job)
+
+
+def enforce_job_capacity(db: Session, project_id: str, idempotency_key=None, configuration_hash=None):
+    # A no-op write acquires the project lock on both SQLite and PostgreSQL;
+    # queued/running work is bounded without changing its workflow revision.
+    db.execute(update(Project).where(Project.id == project_id).values(workflow_revision=Project.workflow_revision))
+    if idempotency_key:
+        existing = db.scalar(select(Job).where(Job.project_id == project_id, Job.idempotency_key == idempotency_key))
+        if existing:
+            if existing.configuration_hash != configuration_hash:
+                raise HTTPException(409, "Idempotency key refers to different inputs or configuration")
+            return existing
+    count = db.scalar(select(func.count()).select_from(Job).where(Job.project_id == project_id,
+                                                                Job.status.in_(["queued", "running"])))
+    if count >= get_settings().max_active_jobs_per_project:
+        raise HTTPException(429, "Project processing queue is full", headers={"Retry-After": "30"})
+    return None
 
 
 @app.post("/api/projects/{project_id}/jobs/{job_id}/cancel")

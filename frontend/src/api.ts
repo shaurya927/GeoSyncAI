@@ -1,3 +1,4 @@
+import { accessToken } from './credentials'
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api').replace(/\/$/, '')
 export type ExportKind = 'geojson' | 'gpkg' | 'csv' | 'lineage' | 'quality'
 
@@ -16,7 +17,7 @@ async function responseError(response: Response) {
 
 function authorizedHeaders(options: RequestInit): Headers {
   const headers = new Headers(options.headers)
-  const token = localStorage.getItem('geosyncai_token')
+  const token = accessToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   return headers
@@ -26,7 +27,12 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
   let response: Response
   try { response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers: authorizedHeaders(options) }) }
   catch { throw new ApiError(`Cannot reach API at ${API_BASE_URL}. Check the connection and retry.`) }
-  if (!response.ok) throw await responseError(response)
+  if (!response.ok) {
+    const error = await responseError(response)
+    const delay = Number(response.headers.get('Retry-After'))
+    if ([429, 503].includes(response.status) && delay > 0) error.message += ` Retry in ${delay} seconds.`
+    throw error
+  }
   if (response.status === 204) return undefined as T
   return await response.json() as T
 }

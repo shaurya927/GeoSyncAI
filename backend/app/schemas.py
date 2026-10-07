@@ -10,8 +10,26 @@ class Token(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=15, max_length=128)
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[a-zA-Z0-9_.-]+$")
+    password: str = Field(min_length=15, max_length=128)
+    role: Literal["viewer", "processor", "reviewer", "steward", "field", "citizen", "admin"] = "viewer"
+
+
+class UserSecurityRequest(BaseModel):
+    role: Literal["viewer", "processor", "reviewer", "steward", "field", "citizen", "admin"]
+    is_active: bool
+    expected_auth_version: int = Field(ge=0)
+    rationale: str = Field(min_length=1, max_length=500)
 
 
 class ProjectCreate(BaseModel):

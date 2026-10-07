@@ -3,7 +3,9 @@
 Build first: VITE_API_BASE_URL=/api npm run build (in frontend).
 """
 import json
+import base64
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -34,6 +36,12 @@ def stack(tmp_path_factory):
     proxy = httpx.Client(base_url=f"http://127.0.0.1:{api_port}",timeout=30)
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(ROOT/"frontend"/"dist"),**kwargs)
+        def end_headers(self):
+            if not self.path.startswith('/api/'):
+                csp = re.search(r'Content-Security-Policy "([^"]+)"', (ROOT/'frontend'/'security-headers.conf').read_text()).group(1)
+                self.send_header('Content-Security-Policy', csp)
+                self.send_header('X-Frame-Options', 'DENY')
+            super().end_headers()
         def forward(self):
             response = proxy.request(self.command,self.path,content=self.rfile.read(int(self.headers.get("Content-Length","0"))),headers={key:value for key,value in self.headers.items() if key.lower() in {"authorization","content-type"}})
             self.send_response(response.status_code)
@@ -84,6 +92,58 @@ def login(page,origin,username,project):
     page.get_by_role("button",name="Sign in to workspace").click()
     expect(page.get_by_role("button",name="Sign out",exact=True)).to_be_visible()
     page.get_by_label("Project",exact=True).select_option(project)
+
+
+def test_production_security_account_controls_and_revocation(stack,browser):
+    api,origin,_=stack
+    project=checked(api.post('/api/projects',json={'name':'Security browser acceptance'}))['id']
+    username='secure_'+project[:8]
+    passphrase='Browser acceptance passphrase 2026!'
+    replacement='Replacement browser passphrase 2026!'
+    page=browser.new_page(viewport={'width':1440,'height':1000})
+    errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+    tile=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGN48f7lfwAJQwPAmGARvgAAAABJRU5ErkJggg==')
+    page.route('https://tile.openstreetmap.org/**',lambda route:route.fulfill(status=200,content_type='image/png',body=tile))
+    try:
+        login(page,origin,'admin',project)
+        assert page.evaluate("localStorage.getItem('geosyncai_token') === null && !!sessionStorage.getItem('geosyncai_token')")
+        admin_session=page.evaluate("sessionStorage.getItem('geosyncai_token')")
+        page.get_by_role('button',name='Account & security',exact=True).click()
+        expect(page.get_by_role('heading',name='Traffic protection',exact=True)).to_be_visible()
+        page.get_by_label('New username').fill(username)
+        page.get_by_label('Initial passphrase').fill(passphrase)
+        page.get_by_role('button',name='Create secure account',exact=True).click()
+        expect(page.locator('body')).to_contain_text('Account created.')
+        checked(api.post(f'/api/projects/{project}/members',json={'username':username,'project_role':'viewer'}))
+        page.get_by_role('button',name='Sign out',exact=True).click()
+        expect(page.get_by_role('button',name='Sign in to workspace')).to_be_visible()
+        assert api.get('/api/auth/me',headers={'Authorization':'Bearer '+admin_session}).status_code==401
+        page.get_by_label('Username',exact=True).fill(username);page.get_by_label('Password',exact=True).fill(passphrase)
+        page.get_by_role('button',name='Sign in to workspace').click()
+        expect(page.get_by_role('button',name='Sign out',exact=True)).to_be_visible()
+        user_session=page.evaluate("sessionStorage.getItem('geosyncai_token')")
+        second=checked(api.post('/api/auth/token',json={'username':username,'password':passphrase}))['access_token']
+        page.get_by_role('button',name='Account & security',exact=True).click()
+        expect(page.get_by_role('heading',name='Create an account',exact=True)).to_have_count(0)
+        page.get_by_label('Current passphrase').fill(passphrase);page.get_by_label('New passphrase',exact=True).fill(replacement)
+        page.get_by_role('button',name='Change passphrase and revoke sessions').click()
+        expect(page.get_by_role('button',name='Sign in to workspace')).to_be_visible()
+        for token in (user_session,second):
+            assert api.get('/api/auth/me',headers={'Authorization':'Bearer '+token}).status_code==401
+        assert api.post('/api/auth/token',json={'username':username,'password':passphrase}).status_code==401
+        assert api.post('/api/auth/token',json={'username':username,'password':replacement}).status_code==200
+        login(page,origin,'admin',project)
+        page.get_by_role('button',name='Account & security',exact=True).click()
+        page.get_by_label('Account change rationale').fill('Disable isolated browser acceptance account')
+        page.get_by_label('Active account '+username,exact=True).uncheck()
+        page.get_by_role('button',name='Save access for '+username,exact=True).click()
+        expect(page.locator('body')).to_contain_text('Access updated and previous sessions revoked.')
+        assert api.post('/api/auth/token',json={'username':username,'password':replacement}).status_code==401
+        headers=page.request.get(origin).headers
+        assert "frame-ancestors 'none'" in headers['content-security-policy'] and headers['x-frame-options']=='DENY'
+        assert api.get('/api/auth/me').headers['cache-control']=='no-store'
+        assert not errors,errors
+    finally:page.close()
 
 
 def upload(api,prefix,name,body,mime="application/geo+json"):

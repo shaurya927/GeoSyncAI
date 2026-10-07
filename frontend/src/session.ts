@@ -1,12 +1,13 @@
 import * as w from './workflowApi'
 import { ApiError } from './api'
+import { accessToken, clearAccessToken } from './credentials'
 
 export type Capabilities = { project_id: string; read_departmental: boolean; process: boolean; review: boolean; publish: boolean; fieldwork: boolean; citizen_records: boolean; exports: boolean }
 type Snapshot = { version: 1; user: w.User; projects: w.Project[]; project: string; verifiedAt: number; expiresAt: number; capabilities: Record<string, Capabilities> }
 const KEY = 'geosyncai-session-v1'
 const OFFLINE_WINDOW = 8 * 60 * 60 * 1000
 export function tokenExpiry(): number {
-  try { const token = localStorage.getItem('geosyncai_token') || ''; return Number(JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp) * 1000 }
+  try { const token = accessToken(); return Number(JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp) * 1000 }
   catch { return 0 }
 }
 export function cachedSession(): Snapshot | undefined {
@@ -20,7 +21,7 @@ export function saveSession(user: w.User, projects: w.Project[], project: string
   try { localStorage.setItem(KEY, JSON.stringify({ version: 1, user, projects: projects.map(p => ({ id: p.id, name: p.name, owner_id: p.owner_id })), project, capabilities, verifiedAt, expiresAt: Math.min(tokenExpiry(), verifiedAt + OFFLINE_WINDOW) })) }
   catch { /* online operation remains available; the field panel reports persistence failures */ }
 }
-export function clearSession() { try { localStorage.removeItem(KEY); localStorage.removeItem('geosyncai_token') } catch { /* unavailable storage is already inaccessible */ } }
+export function clearSession() { clearAccessToken(); try { localStorage.removeItem(KEY) } catch { /* unavailable storage is already inaccessible */ } }
 export async function verifyAccount(expected: w.User, project: string) {
   const user = await w.get<w.User>('/auth/me')
   if (user.id !== expected.id) throw new ApiError('Account changed. Sign in as the owner of these drafts.', 401)

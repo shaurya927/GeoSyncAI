@@ -42,3 +42,16 @@ workflow must run on the uploaded revision before production use. No fresh
 service-stack pass is claimed here. Conditional government/AR/GNN/photogrammetry/
 blockchain integrations remain outside this prototype, as the requirements and
 submission claims state. No further CLI-agent prompt is needed for these repairs.
+
+## Security and traffic update
+
+Implemented scoped/revocable sessions, stronger password storage, real account
+administration, shared traffic budgets, body/time/concurrency/queue limits, hardened
+upload archives, browser CSP, trusted proxy identity and non-root container controls.
+Added Security UI, production refusal of demo defaults, provisioning and security
+documentation. Patched reported MapLibre/pytest advisories and added dependency
+audits plus CodeQL. Latest local tests: 69 backend passes/3 service skips, 5 browser
+passes; both dependency audits report no known vulnerabilities. Service CI will
+verify Redis atomics, PostGIS/Celery and production Nginx/non-root/burst behavior on
+the published revision. Current scope and remaining hosting requirements are in
+`SECURITY.md`; existing private data is retained.

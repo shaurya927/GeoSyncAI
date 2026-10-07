@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import maplibregl from 'maplibre-gl'
+import * as maplibregl from './maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import * as api from './api'
 import * as w from './workflowApi'
@@ -8,10 +8,12 @@ import GeometryEditor from './GeometryEditor'
 import RegistryTools from './RegistryTools'
 import QueryPanel from './QueryPanel'
 import { BASEMAP } from './basemap'
+import { accessToken, storeAccessToken } from './credentials'
+import SecurityPanel from './SecurityPanel'
 import { cachedSession, clearSession, saveSession, tokenExpiry, type Capabilities } from './session'
 
-type View = 'overview' | 'datasets' | 'review' | 'alerts' | 'versions' | 'fieldwork' | 'geometry' | 'queries' | 'compliance'
-const titles: Record<View, string> = { overview: 'Overview', datasets: 'Datasets', review: 'Review queue', alerts: 'Change alerts', versions: 'Versions & history', fieldwork: 'Fieldwork / citizen', geometry: 'Boundary editor', queries: 'Read-only queries', compliance: 'Compliance screening' }
+type View = 'overview' | 'datasets' | 'review' | 'alerts' | 'versions' | 'fieldwork' | 'geometry' | 'queries' | 'compliance' | 'security'
+const titles: Record<View, string> = { overview: 'Overview', datasets: 'Datasets', review: 'Review queue', alerts: 'Change alerts', versions: 'Versions & history', fieldwork: 'Fieldwork / citizen', geometry: 'Boundary editor', queries: 'Read-only queries', compliance: 'Compliance screening', security: 'Account & security' }
 const canonicalFields = ['parcel_id', 'survey_number', 'property_account', 'village', 'village_code', 'district', 'ward', 'recorded_area', 'area_units']
 const format = (value: unknown) => JSON.stringify(value, null, 2)
 const label = (feature?: w.Feature) => feature?.original_id || feature?.id || 'Unavailable'
@@ -326,7 +328,7 @@ export default function App() {
   const restore = useCallback(async () => {
     const cached = cachedSession()
     try {
-      if (!localStorage.getItem('geosyncai_token')) { setBooting(false); return }
+      if (!accessToken()) { setBooting(false); return }
       if (tokenExpiry() <= Date.now()) throw new Error('Session expired. Sign in again; device drafts are retained.')
       const current = await w.get<w.User>('/auth/me')
       const ps = await w.get<w.Project[]>('/projects')
@@ -356,11 +358,14 @@ export default function App() {
   }, [user, offlineSession])
   const login = async () => {
     const result = await w.post<{ access_token: string; user: w.User }>('/auth/token', { username, password })
-    localStorage.setItem('geosyncai_token', result.access_token)
+    storeAccessToken(result.access_token, result.user.role)
     await restore(); setPassword('')
   }
-  const logout = () => {
+  const logout = async () => {
+    let serverRevoked = false
+    try { await w.post('/auth/logout'); serverRevoked = true } catch { /* local sign-out must still lock retained device drafts */ }
     clearSession(); setUser(undefined); setProject(''); setProjects([]); setCaps({}); setOfflineSession(false); setDatasets([]); setFeatures([]); setEvidence([]); setParcels([]); setVersions([]); setNotice(''); setError(''); setUsername(''); setPassword(''); setView('overview')
+    if (!serverRevoked) setError('Signed out on this device. The server could not revoke the session; it expires automatically. Offline drafts are retained.')
     // Retain account-scoped unsynced evidence. Another account cannot render it.
   }
   const selectedEvidence = evidence.find(e => e.id === selected)
@@ -389,7 +394,7 @@ export default function App() {
     <div className="login-panel"><form className="login-form" onSubmit={e => { e.preventDefault(); run(login) }}><Brand /><h2>Officer workspace</h2><label>Username<input required value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" /></label>
       <label>Password<input required type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" /></label>{error && <div role="alert" className="error-banner">{error}</div>}
       <button className="button button-primary button-wide" disabled={busy}>{busy ? 'Connecting…' : 'Sign in to workspace'}</button><p>Local demonstration accounts must be explicitly seeded. All workspace actions use the API.</p></form></div></main>
-    const availableViews = (Object.keys(titles) as View[]).filter(v => departmental || v === 'overview' || (v === 'fieldwork' && (fieldworkCapable || citizenCapable)) || (v === 'queries' && fieldworkCapable && !offlineSession))
+    const availableViews = (Object.keys(titles) as View[]).filter(v => departmental || v === 'overview' || v === 'security' || (v === 'fieldwork' && (fieldworkCapable || citizenCapable)) || (v === 'queries' && fieldworkCapable && !offlineSession))
    return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><Brand /></div><div className="workspace-switcher"><label>Project<select aria-label="Project" value={project} onChange={e => setProject(e.target.value)}><option value="">Select project</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label></div>
      <nav className="sidebar-nav">{availableViews.map(v => <button key={v} className={view === v ? 'active' : ''} onClick={() => setView(v)}>{titles[v]}</button>)}</nav>
     <div className="sidebar-bottom"><p>{user.username} · {user.role}</p><button className="button button-secondary" onClick={logout}>Sign out</button></div></aside>
@@ -398,6 +403,7 @@ export default function App() {
       <button className="button button-secondary mobile-project" onClick={logout}>Sign out</button>
        <select aria-label="Export" defaultValue="" disabled={!departmental || !versions.length} onChange={e => { if (e.target.value) download(e.target.value as api.ExportKind); e.target.value = '' }}><option value="">Export latest version</option>{['geojson', 'gpkg', 'csv', 'lineage', 'quality'].map(kind => <option key={kind}>{kind}</option>)}</select></div></header>
       <main className="page-content" aria-busy={busy}>{error && <div role="alert" className="error-banner">{error} <button onClick={() => run(refresh)}>Refresh evidence</button></div>}{notice && <p role="status" className="notice-banner">{notice}</p>}{busy && <p role="status">Working…</p>}{offlineSession && <p className="notice-banner" role="status">Offline field session · cached assignments expire within 8 hours or at token/assignment expiry. Reconnection requires server authorization.</p>}
+      {view === 'security' && <SecurityPanel key={user.id} user={user} offline={offlineSession} run={run} onPasswordChanged={async () => { await logout(); setError('Passphrase changed and all sessions revoked. Sign in with your new passphrase.') }} />}
       {view === 'overview' && <><div className="welcome-row"><div><p className="eyebrow">{new Date().toLocaleDateString()}</p><h1>Welcome, {user.username}</h1><p>Source records, decisions and publication evidence.</p></div></div>
         <div className="metric-grid">{[['Sources', datasets.length], ['Records', features.length], ['Open review', open.length], ['Published versions', versions.length]].map(([name, value]) => <section key={name} className="metric-card"><div className="metric-value">{value}</div><div className="metric-label">{name}</div></section>)}</div>
         <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { const p = await w.post<w.Project>('/projects', { name: newProject }); setProjects(await w.get<w.Project[]>('/projects')); setProject(p.id); setNewProject('') }) }}><h3>Create study-area project</h3><label>Project name<input required value={newProject} onChange={e => setNewProject(e.target.value)} /></label><button className="button button-primary" disabled={!canCreate || busy}>Create project</button></form>
@@ -437,6 +443,6 @@ export default function App() {
         {view === 'queries' && (departmental || fieldworkCapable) && !offlineSession && project && <><h1>Read-only query workspace</h1><QueryPanel key={`${project}-${user.id}`} project={project} fieldOnly={!departmental} run={run} /></>}
         {view === 'compliance' && departmental && project && <><h1>Compliance screening</h1><CompliancePanel key={`${project}-${user.id}`} project={project} parcels={parcels} writable={writable} canReview={canReview} run={run} /></>}
         {view === 'fieldwork' && project && (fieldworkCapable || citizenCapable) && (user.role === 'citizen' ? <CitizenPanel key={`${project}-${user.id}`} project={project} run={run} /> : <><FieldworkPanel key={`${project}-${user.id}`} project={project} user={user} run={run} />{canReview && <OperationsPanel key={`${project}-${user.id}`} project={project} parcels={parcels} run={run} />}</>)}
-      {!project && view !== 'overview' && <p>Create or select a project in Overview.</p>}
+      {!project && view !== 'overview' && view !== 'security' && <p>Create or select a project in Overview.</p>}
       </main><footer className="app-footer">GeoSyncAI · SIH26013 · Team Git Good / 151551 · Review support, not legal certification</footer></div></div>
 }

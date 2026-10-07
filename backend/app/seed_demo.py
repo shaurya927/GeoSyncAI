@@ -6,9 +6,12 @@ through an administrative provisioning process.
 """
 from .db import get_db, init_db
 from .main import bootstrap
+from .config import get_settings
 
 
 def main() -> None:
+    if get_settings().production_mode:
+        raise SystemExit("Demonstration seeding is forbidden in production mode")
     init_db()
     db = next(get_db())
     try:
