@@ -50,8 +50,11 @@ administration, shared traffic budgets, body/time/concurrency/queue limits, hard
 upload archives, browser CSP, trusted proxy identity and non-root container controls.
 Added Security UI, production refusal of demo defaults, provisioning and security
 documentation. Patched reported MapLibre/pytest advisories and added dependency
-audits plus CodeQL. Latest local tests: 69 backend passes/3 service skips, 5 browser
-passes; both dependency audits report no known vulnerabilities. Service CI will
-verify Redis atomics, PostGIS/Celery and production Nginx/non-root/burst behavior on
-the published revision. Current scope and remaining hosting requirements are in
-`SECURITY.md`; existing private data is retained.
+audits plus CodeQL. Latest full local tests: 71 backend passes/3 service skips,
+5 browser passes; the final security suite passed 23 cases/1 Redis skip. Both
+dependency audits report no known vulnerabilities. Final code `e8c2d96` passed
+service CI, including Redis atomics, PostGIS/Celery and production Nginx/non-root/
+burst behavior: https://github.com/shaurya927/GeoSyncAI/actions/runs/37656234170.
+Both CodeQL languages completed, with zero open findings after fixes. Current scope
+and remaining hosting requirements are in `SECURITY.md`; existing private data is
+retained and excluded from the source package. No public deployment occurred.

@@ -14,7 +14,7 @@ new claims are deliberately invalid after this upgrade: sign in again.
 
 Connected sign-out revokes that token. Changing a passphrase or account access
 revokes all previous sessions. Administrators can create accounts, edit access,
-disable accounts and revoke sessions on the **Security** page. Account creation
+disable accounts and revoke sessions on the **Account & security** page. Account creation
 does not grant project access. Self-disable/demotion and removal of the last
 active administrator are rejected. Changes are audited without passwords/tokens.
 
@@ -115,7 +115,8 @@ No automatic client retry loop or external load test is performed.
    CPU/memory. Maintain container OS packages, Redis/PostGIS and reverse proxy
    images. Application dependency audit passes do not audit the container OS.
 
-CORS and Host allowlists have no wildcard. API documentation is off by default;
+CORS and Host allowlists forbid a blanket `*` entry. Use explicit trusted hosts
+and origins. API documentation is off by default;
 `API_DOCS_ENABLED=true` can enable it on a controlled local backend. For Vite on a
 different port, explicitly add that origin to backend `CORS_ORIGINS`. Production
 responses apply CSP, anti-framing, nosniff, referrer and permissions policies.

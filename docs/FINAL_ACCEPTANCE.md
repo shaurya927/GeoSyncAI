@@ -147,11 +147,13 @@ settings and the offline/hosting boundaries.
 
 Fresh local results on the security implementation:
 
-- Backend suite: **69 passed, 3 skipped**, 54.18 s. Skips require local PostGIS,
+- Backend suite after scan fixes: **71 passed, 3 skipped**, 58.13 s. Skips require local PostGIS,
   Redis/Celery and Redis atomic-counter services; these run in service CI.
-- Real HTTP browser journeys: **5 passed**, 63.73 s. Includes both basemap configurations,
+- Real HTTP browser journeys: **5 passed**, 66.93 s. Includes both basemap configurations,
   normal geospatial publication, production offline/geometry workflows and a new
   account creation/passphrase/disable/logout/session-revocation journey under CSP.
+- Final native-coordinate redaction regression: security suite **23 passed, 1 Redis
+  skip**, 7.88 s. Native library details are excluded from API/quarantine reports.
 - `npm audit --audit-level=high`: **0 known vulnerabilities**.
 - `pip-audit -r backend/requirements-dev.txt --no-deps --disable-pip`: **no known
   vulnerabilities** in the pinned application/test requirements at check time.
@@ -160,10 +162,23 @@ Fresh local results on the security implementation:
 
 Acceptance CI now also verifies non-root API/worker identities, production Nginx
 headers, Redis-backed UI, token logout and a bounded burst against its disposable
-stack. Separate CodeQL analysis covers Python and JavaScript/TypeScript. These new
-service checks are pending the security revision's GitHub run; local evidence does
-not substitute for that result. The prior basemap revision `54e0191` passed
-Acceptance: https://github.com/shaurya927/GeoSyncAI/actions/runs/37621512066.
+stack. Separate CodeQL analysis covers Python and JavaScript/TypeScript.
+
+The final security code revision `e8c2d961e22d4d1212c282608f79cd639b6c88f3` passed
+the full [Acceptance workflow](https://github.com/shaurya927/GeoSyncAI/actions/runs/37656234170):
+PostGIS/Redis/Celery backend checks, both officer browser cases, all three production
+repair/security browser cases, Compose startup, non-root identities and Nginx
+security/traffic smoke. The separate [Code security workflow](https://github.com/shaurya927/GeoSyncAI/actions/runs/37656234065)
+completed for both languages, and the repository has **zero open CodeQL findings**
+after these fixes. Findings were corrected rather than suppressed. The earlier
+test-harness project-switch race was fixed by waiting for the unique created project
+before selecting/uploading a source; actual server/browser checks remain enabled.
+
+Fresh extracted-ZIP startup, API authentication/upload, bundled map worker under CSP,
+traffic/account UI, server token logout and restart/source-hash retention passed.
+Original preview data retained all six accounts, two projects, three datasets and
+three unchanged immutable source files. Private data/secrets are excluded from the
+ZIP. Its manifest and external verification JSON identify the exact packaged revision.
 
 These changes are tested protection controls, not a penetration-test certificate
 or a measured user-capacity claim. Public deployment still requires HTTPS, protected
