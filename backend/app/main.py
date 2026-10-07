@@ -17,7 +17,6 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from shapely.geometry import shape
 
 from .auth import (CurrentUser, ensure_project_access, ensure_project_membership, hash_password, verify_password,
                    create_access_token, project_member, utc_expired, capability_allowed)
@@ -31,7 +30,7 @@ from .models import (Dataset, Job, MatchProposal, Project, ProjectMember, Review
 from .schemas import (CRSConfirmation, ChangeRequest, DatasetRegister, LoginRequest, MatchRequest, MemberCreate,
                        ProjectCreate, ProjectOut, ReviewRequest, SchemaMappingRequest, SelectionRequest, PolicyRequest, Token,
                        DatasetMetadataRequest, MappingDictionaryRequest, DepartmentTemplateRequest, ReconciliationRequest,
-                       ReconciliationDecision, GeometryChangeSetRequest, GeometryDecision, MeasurementRequest,
+                       ReconciliationDecision, GeometryChangeSetRequest, GeometryDraftRequest, GeometryDecision, MeasurementRequest,
                         GroundControlRequest, GroundControlApprovalRequest, TrainingExampleRequest, RankerTrainRequest, RankerActivationRequest, AssignmentRequest, AssignmentUpdateRequest,
                        FieldEvidenceRequest, FieldEvidenceResolutionRequest, QueryRequest, ComplianceRuleRequest, ComplianceEvaluateRequest,
                         CitizenGrantRequest, CitizenGrantUpdateRequest, CitizenCaseRequest, CitizenCaseResponseRequest)
@@ -42,7 +41,11 @@ from .publication import canonical_output_context, canonical_sha256, publish, va
 from .policy import processing_policy
 from .tasks import dispatch_job, recover_jobs, configuration_hash as job_configuration_hash
 from .advanced import (build_reconciliation, compliance_result, geometry_measurements, resolve_canonical_geometry, validate_compliance_rule,
-                       fit_control_points, measure_geometry, parse_structured_query, train_ranker)
+                       measure_geometry, train_ranker)
+from .querying import execute_query, readable_dataset_ids
+from .ground_control import fit_session, control_coverage
+from .geometry_editing import preview_geometry
+from .advanced import geometry_submission_gates
 
 
 DEMO_USERS = {"viewer": "viewer", "processor": "processor", "reviewer": "reviewer", "admin": "admin",
@@ -232,7 +235,7 @@ def project_dashboard(project_id: str, db: Db, user: CurrentUser):
 def mapping_templates(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [{'id':m.id, 'dataset_id':m.dataset_id, 'version':m.version, 'mapping':m.mapping}
-            for m in db.scalars(select(SchemaMapping).where(SchemaMapping.project_id == project_id, SchemaMapping.status == 'confirmed'))]
+            for m in db.scalars(select(SchemaMapping).where(SchemaMapping.project_id == project_id, SchemaMapping.status == 'confirmed', SchemaMapping.dataset_id.in_(readable_dataset_ids(db, project_id, user))))]
 
 
 @app.post("/api/projects/{project_id}/members")
@@ -350,13 +353,16 @@ def dataset_response(dataset: Dataset) -> dict:
 @app.get("/api/projects/{project_id}/datasets")
 def list_datasets(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
-    return [dataset_response(d) for d in db.scalars(select(Dataset).where(Dataset.project_id == project_id).order_by(Dataset.uploaded_at.desc()))]
+    allowed = readable_dataset_ids(db, project_id, user)
+    return [dataset_response(d) for d in db.scalars(select(Dataset).where(Dataset.project_id == project_id, Dataset.id.in_(allowed)).order_by(Dataset.uploaded_at.desc()))]
 
 
 @app.patch("/api/projects/{project_id}/datasets/{dataset_id}/metadata")
 def update_dataset_metadata(project_id: str, dataset_id: str, payload: DatasetMetadataRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
     dataset = validate_dataset(db, project_id, dataset_id)
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
+        raise HTTPException(403, "Restricted source requires project reviewer permission")
     if payload.expected_content_hash and payload.expected_content_hash != dataset.content_hash:
         raise HTTPException(409, "Source content changed; register a new version instead of overwriting metadata")
     linked = db.scalar(select(ParcelSourceLink.id).join(SourceFeature, SourceFeature.id == ParcelSourceLink.source_feature_id)
@@ -429,7 +435,8 @@ async def upload_raster_asset(project_id: str, db: Db, user: CurrentUser, file: 
 def list_raster_assets(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [raster_response(asset) for asset in db.scalars(select(RasterAsset).where(
-        RasterAsset.project_id == project_id).order_by(RasterAsset.created_at.desc()))]
+        RasterAsset.project_id == project_id).order_by(RasterAsset.created_at.desc()))
+            if asset.access_classification != "restricted" or capabilities(project_id, db, user)["review"]]
 
 
 @app.get("/api/projects/{project_id}/raster-assets/{asset_id}/bytes")
@@ -438,7 +445,7 @@ def download_raster_asset(project_id: str, asset_id: str, db: Db, user: CurrentU
     asset = db.get(RasterAsset, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(404, "Raster asset not found")
-    if asset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+    if asset.access_classification == "restricted" and not capabilities(project_id, db, user)["review"]:
         raise HTTPException(403, "Restricted raster requires steward or reviewer permission")
     path = Path(asset.raw_path)
     if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != asset.content_hash:
@@ -465,6 +472,8 @@ def _raster_png(path: str) -> bytes:
         pixels = np.clip((values[0] - low) * scale, 0, 255).astype("uint8")
         color_type, rows = 0, b"".join(b"\x00" + row.tobytes() for row in pixels)
     else:
+        if count == 2:
+            values = np.concatenate([values, values[:1]], axis=0)
         low, high = float(np.nanmin(values)), float(np.nanmax(values))
         scale = 255.0 / (high - low) if high > low else 1.0
         pixels = np.clip((values - low) * scale, 0, 255).astype("uint8").transpose(1, 2, 0)
@@ -479,7 +488,7 @@ def preview_raster_asset(project_id: str, asset_id: str, db: Db, user: CurrentUs
     asset = db.get(RasterAsset, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(404, "Raster asset not found")
-    if asset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+    if asset.access_classification == "restricted" and not capabilities(project_id, db, user)["review"]:
         raise HTTPException(403, "Restricted raster requires steward or reviewer permission")
     if not asset.source_crs:
         raise HTTPException(409, "Raster CRS is unresolved; preview is blocked until it is confirmed")
@@ -567,6 +576,8 @@ def save_department_template(project_id: str, payload: DepartmentTemplateRequest
 def confirm_crs(project_id: str, dataset_id: str, payload: CRSConfirmation, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
     dataset = validate_dataset(db, project_id, dataset_id)
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
+        raise HTTPException(403, "Restricted source requires project reviewer permission")
     try:
         report = confirm_dataset_crs(db, dataset, payload.crs, user.id, payload.reason)
     except ValueError as exc:
@@ -578,6 +589,8 @@ def confirm_crs(project_id: str, dataset_id: str, payload: CRSConfirmation, db: 
 def get_schema_mapping(project_id: str, dataset_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     dataset = validate_dataset(db, project_id, dataset_id)
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
+        raise HTTPException(403, "Restricted source requires project reviewer permission")
     mapping = db.scalar(select(SchemaMapping).where(SchemaMapping.dataset_id == dataset.id)
                         .order_by(SchemaMapping.version.desc()))
     if not mapping:
@@ -613,6 +626,8 @@ def get_schema_mapping(project_id: str, dataset_id: str, db: Db, user: CurrentUs
 def save_schema_mapping(project_id: str, dataset_id: str, payload: SchemaMappingRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
     dataset = validate_dataset(db, project_id, dataset_id)
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
+        raise HTTPException(403, "Restricted source requires project reviewer permission")
     version = dataset.schema_mapping_version + 1
     fields = (dataset.validation_report or {}).get("schema_fields", [])
     allowed = {"parcel_id", "survey_number", "property_account", "village", "village_code", "district", "ward", "recorded_area", "area_units"}
@@ -658,7 +673,7 @@ def list_features(project_id: str, dataset_id: str, db: Db, user: CurrentUser, l
     dataset = db.get(Dataset, dataset_id)
     if not dataset or dataset.project_id != project_id:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    if dataset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
         raise HTTPException(403, "Restricted source features require steward or reviewer permission")
     limit = max(1, min(limit, 1000)); offset = max(0, offset)
     bounds = None
@@ -696,7 +711,7 @@ def download_raw(project_id: str, dataset_id: str, db: Db, user: CurrentUser):
     dataset = db.get(Dataset, dataset_id)
     if not dataset or dataset.project_id != project_id or not dataset.raw_path:
         raise HTTPException(status_code=404, detail="Raw file not found")
-    if dataset.access_classification == "restricted" and user.role not in {"admin", "reviewer", "steward"}:
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
         raise HTTPException(status_code=403, detail="Restricted source download requires steward or reviewer permission")
     path = get_settings().storage_path / (dataset.id + "-" + (dataset.original_filename or "upload.bin").replace("..", ""))
     # Raw path is generated by the service and never taken from a URL parameter.
@@ -710,6 +725,7 @@ def download_raw(project_id: str, dataset_id: str, db: Db, user: CurrentUser):
 @app.post("/api/projects/{project_id}/match")
 def match(project_id: str, payload: MatchRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
+    ensure_readable_inputs(db, project_id, user, [payload.left_dataset_id, payload.right_dataset_id])
     validate_dataset_pair(db, project_id, payload.left_dataset_id, payload.right_dataset_id)
     require_spatial_ready(validate_dataset(db, project_id, payload.left_dataset_id))
     require_spatial_ready(validate_dataset(db, project_id, payload.right_dataset_id))
@@ -724,6 +740,7 @@ def match(project_id: str, payload: MatchRequest, db: Db, user: CurrentUser):
 @app.post("/api/projects/{project_id}/topology/{dataset_id}")
 def topology(project_id: str, dataset_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
+    ensure_readable_inputs(db, project_id, user, [dataset_id])
     validate_dataset(db, project_id, dataset_id)
     require_spatial_ready(validate_dataset(db, project_id, dataset_id))
     return run_topology(db, project_id, dataset_id)
@@ -735,12 +752,15 @@ def matches(project_id: str, db: Db, user: CurrentUser):
     return [{"id": p.id, "left_feature_id": p.left_feature_id, "right_feature_id": p.right_feature_id,
              "score": p.score, "score_type": p.score_type, "status": p.status, "revision": p.revision,
              "evidence": p.evidence}
-            for p in db.scalars(select(MatchProposal).where(MatchProposal.project_id == project_id))]
+            for p in db.scalars(select(MatchProposal).where(MatchProposal.project_id == project_id))
+            if source_ids_readable(db, project_id, user, [p.left_feature_id, p.right_feature_id])]
 
 
 @app.post("/api/projects/{project_id}/reconciliations")
 def create_reconciliation(project_id: str, payload: ReconciliationRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
+    if not source_ids_readable(db, project_id, user, payload.source_feature_ids):
+        raise HTTPException(403, "Reconciliation contains restricted or unavailable source evidence")
     try:
         case = build_reconciliation(db, project_id, payload.source_feature_ids, payload.anchor_feature_id, user.id, payload.rationale)
     except ValueError as exc:
@@ -753,7 +773,8 @@ def create_reconciliation(project_id: str, payload: ReconciliationRequest, db: D
 def list_reconciliations(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [reconciliation_response(case) for case in db.scalars(select(ReconciliationCase).where(
-        ReconciliationCase.project_id == project_id).order_by(ReconciliationCase.created_at.desc()))]
+        ReconciliationCase.project_id == project_id).order_by(ReconciliationCase.created_at.desc()))
+            if source_ids_readable(db, project_id, user, case.source_feature_ids)]
 
 
 @app.post("/api/projects/{project_id}/reconciliations/{case_id}/decision")
@@ -826,6 +847,17 @@ def reconciliation_response(case: ReconciliationCase) -> dict:
             "competing_values": case.competing_values, "evidence": case.evidence, "rationale": case.rationale}
 
 
+@app.post("/api/projects/{project_id}/geometry-drafts")
+def geometry_draft_preview(project_id: str, payload: GeometryDraftRequest, db: Db, user: CurrentUser):
+    ensure_project_access(db, project_id, user, write=True)
+    try:
+        return preview_geometry(db, project_id, user, payload)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/projects/{project_id}/geometry-changes")
 def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
@@ -835,6 +867,8 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
                                                           ParcelEntity.status == "active")))
     if len(entities) != len(set(payload.parcel_entity_ids)):
         raise HTTPException(404, "Every parcel in a geometry changeset must belong to this project")
+    if not parcel_ids_readable(db, project_id, user, payload.parcel_entity_ids):
+        raise HTTPException(403, "Participating parcels contain restricted evidence")
     if payload.successor_ids:
         raise HTTPException(422, "Successor identities are server-generated and cannot be supplied by the client")
     if payload.operation == "split" and len(payload.parcel_entity_ids) != 1:
@@ -876,6 +910,14 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
         raise HTTPException(422, str(exc)) from exc
     if payload.operation in {"split", "merge"} and abs(measurements["area_conservation_delta_m2"]) > 0.01:
         raise HTTPException(422, f"{payload.operation.title()} draft does not conserve source area within 0.01 m²")
+    if payload.operation in {"split", "merge"} and (
+            measurements["partition_difference_m2"] > 0.01 or measurements["draft_overlap_m2"] > 0.01):
+        raise HTTPException(422, "Split/merge must preserve predecessor coverage without overlapping children")
+    if payload.expected_geometry_fingerprint and payload.expected_geometry_fingerprint != canonical_sha256(measurements["before_geometries"]):
+        raise HTTPException(409, "Approved boundaries changed after preview; reload and preview again")
+    gates = geometry_submission_gates(payload.operation, measurements, processing_policy(db, project_id))
+    if gates:
+        raise HTTPException(422, {"geometry_gates": gates, "affected_neighbors": measurements["affected_neighbors"]})
     change_id = uid()
     draft_geometries = dict(payload.draft_geometries)
     successor_ids = list(payload.successor_ids)
@@ -915,7 +957,8 @@ def create_geometry_changeset(project_id: str, payload: GeometryChangeSetRequest
 def list_geometry_changes(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [geometry_changeset_response(change) for change in db.scalars(select(GeometryChangeSet).where(
-        GeometryChangeSet.project_id == project_id).order_by(GeometryChangeSet.created_at.desc()))]
+        GeometryChangeSet.project_id == project_id).order_by(GeometryChangeSet.created_at.desc()))
+            if parcel_ids_readable(db, project_id, user, change.parcel_entity_ids)]
 
 
 @app.post("/api/projects/{project_id}/geometry-changes/{change_id}/decision")
@@ -955,6 +998,8 @@ def decide_geometry_changeset(project_id: str, change_id: str, payload: Geometry
             raise HTTPException(409, "Canonical geometry changed since this draft; submit a refreshed draft")
         if change.measurements.get("policy") != processing_policy(db, project_id):
             raise HTTPException(409, "Processing policy changed since this draft")
+        if geometry_submission_gates(change.operation, measured, processing_policy(db, project_id)):
+            raise HTTPException(409, "Neighbor topology changed since the draft; reload and review a new preview")
     claimed = db.execute(update(GeometryChangeSet).where(GeometryChangeSet.id == change.id,
                          GeometryChangeSet.revision == payload.expected_revision,
                          GeometryChangeSet.status.in_(["draft", "deferred"]))
@@ -1010,38 +1055,21 @@ def measure(project_id: str, payload: MeasurementRequest, db: Db, user: CurrentU
 @app.post("/api/projects/{project_id}/ground-control")
 def create_ground_control(project_id: str, payload: GroundControlRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
-    validate_dataset(db, project_id, payload.dataset_id)
-    # Coordinates are supplied as {source:[x,y], target:[x,y]}; residuals are
-    # explicit and independent checkpoints can be tagged in the point payload.
-    for point in payload.control_points:
-        source = point.get("source"); target = point.get("target")
-        if not isinstance(source, list) or not isinstance(target, list) or len(source) < 2 or len(target) < 2:
-            raise HTTPException(422, "Each control point needs source and target coordinate pairs")
-    fitting_points = [point for point in payload.control_points if not point.get("checkpoint")]
-    checkpoint_points = [point for point in payload.control_points if point.get("checkpoint")]
+    dataset = validate_dataset(db, project_id, payload.dataset_id)
+    if dataset.id not in readable_dataset_ids(db, project_id, user):
+        raise HTTPException(403, "Restricted source requires project review permission")
     try:
-        fit = fit_control_points(payload.method, fitting_points, checkpoint_points)
+        source_crs, target_crs, fit = fit_session(db, dataset, payload)
     except (ValueError, TypeError, FloatingPointError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    dataset = validate_dataset(db, project_id, payload.dataset_id)
-    source_crs = payload.source_crs or dataset.declared_crs
-    target_crs = payload.target_crs or source_crs
-    if not source_crs or not target_crs:
-        raise HTTPException(422, "Source and target CRS are required for a ground-control session")
-    try:
-        from pyproj import CRS
-        CRS.from_user_input(source_crs); CRS.from_user_input(target_crs)
-    except Exception as exc:
-        raise HTTPException(422, "Invalid ground-control source or target CRS") from exc
-    fit["max_checkpoint_residual_threshold"] = payload.max_checkpoint_residual
-    session = GroundControlSession(project_id=project_id, dataset_id=payload.dataset_id, method=payload.method,
+    session = GroundControlSession(project_id=project_id, dataset_id=dataset.id, method=payload.method,
                                    source_crs=source_crs, target_crs=target_crs,
                                    control_points=payload.control_points,
                                    residuals={"count": len(payload.control_points), **fit}, created_by=user.id)
     db.add(session)
     touch_project(db, project_id)
     audit(db, "ground_control_created", user.id, project_id, "ground_control", session.id,
-          {"dataset_id": payload.dataset_id, "method": payload.method, "residuals": session.residuals})
+          {"dataset_id": dataset.id, "method": payload.method, "residuals": session.residuals})
     db.commit()
     return ground_control_response(session)
 
@@ -1051,7 +1079,7 @@ def list_ground_control(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [ground_control_response(session) for session in db.scalars(
         select(GroundControlSession).where(GroundControlSession.project_id == project_id)
-        .order_by(GroundControlSession.created_at.desc()))]
+        .order_by(GroundControlSession.created_at.desc())) if session.dataset_id in readable_dataset_ids(db, project_id, user)]
 
 
 @app.post("/api/projects/{project_id}/ground-control/{session_id}/approve")
@@ -1063,13 +1091,22 @@ def approve_ground_control(project_id: str, session_id: str, db: Db, user: Curre
         raise HTTPException(404, "Ground control session not found")
     if payload is None:
         payload = GroundControlApprovalRequest(expected_revision=session.revision, rationale="Legacy approval request")
+    if session.status != "draft":
+        raise HTTPException(409, "Ground-control approval is final; create a new session")
     if session.revision != payload.expected_revision:
         raise HTTPException(409, "Ground-control session changed; refresh before approval")
+    if session.residuals.get("residual_units") != "metres":
+        raise HTTPException(409, "Refit legacy controls with explicit metre residuals before approval")
     if not session.residuals.get("checkpoint_count"):
         raise HTTPException(409, "An independent checkpoint is required before approval")
     if session.residuals.get("checkpoint_max") is None or session.residuals["checkpoint_max"] > session.residuals.get("max_checkpoint_residual_threshold", 1.0):
         raise HTTPException(409, "Independent checkpoint residual exceeds the configured threshold")
     source_dataset = validate_dataset(db, project_id, session.dataset_id)
+    if source_dataset.content_hash != session.residuals.get("source_content_hash"):
+        raise HTTPException(409, "Source changed since the controls were fitted")
+    coverage = control_coverage(db, source_dataset.id, session.control_points)
+    if not coverage["covers_source"]:
+        raise HTTPException(409, "Source features fall outside validated control/checkpoint coverage; add independently verified controls")
     try:
         aligned_dataset = apply_ground_control_version(db, source_dataset, session, user.id, payload.rationale)
     except ValueError as exc:
@@ -1103,7 +1140,8 @@ def apply_ground_control_version(db: Session, source_dataset: Dataset, session: 
                       source_organization=source_dataset.source_organization, capture_date=source_dataset.capture_date,
                       content_hash=source_dataset.content_hash, original_filename=source_dataset.original_filename,
                       mime_type=source_dataset.mime_type, raw_path=source_dataset.raw_path,
-                      declared_crs=session.target_crs, access_classification=source_dataset.access_classification,
+                      declared_crs=source_dataset.declared_crs, parent_dataset_id=source_dataset.id,
+                      access_classification=source_dataset.access_classification,
                       accuracy_metadata=source_dataset.accuracy_metadata, metadata_json=source_dataset.metadata_json,
                       administrative_namespace=source_dataset.administrative_namespace,
                       license_classification=source_dataset.license_classification, provenance=source_dataset.provenance,
@@ -1118,6 +1156,8 @@ def apply_ground_control_version(db: Session, source_dataset: Dataset, session: 
             try:
                 transformed = affine_transform(shape(source.original_geometry), affine_parameters)
                 normalized = transformed if session.target_crs == "EPSG:4326" else reproject(transformed, session.target_crs, "EPSG:4326")
+                from .spatial import check_coordinates
+                check_coordinates(normalized, True)
                 if not normalized.is_valid:
                     raise ValueError(f"Aligned geometry {source.id} is invalid")
                 normalized_geometry = mapping(normalized)
@@ -1132,6 +1172,16 @@ def apply_ground_control_version(db: Session, source_dataset: Dataset, session: 
                               status="processed" if normalized_geometry or not source.original_geometry else "quarantined",
                               processing_reason=None if normalized_geometry or not source.original_geometry else "Alignment produced no valid geometry",
                               **spatial_column(shape(normalized_geometry) if normalized_geometry else None, "EPSG:4326")))
+    aligned.record_count = source_dataset.record_count
+    aligned.validation_report = {"alignment": "approved", "source_dataset_id": source_dataset.id, "residual_units": "metres"}
+    source_mapping = db.scalar(select(SchemaMapping).where(SchemaMapping.dataset_id == source_dataset.id)
+                               .order_by(SchemaMapping.version.desc()))
+    if source_mapping:
+        aligned.schema_mapping_version = source_mapping.version
+        db.add(SchemaMapping(dataset_id=aligned.id, project_id=source_dataset.project_id,
+                            version=source_mapping.version, status=source_mapping.status,
+                            mapping=source_mapping.mapping, source_fields=source_mapping.source_fields,
+                            created_by=actor_id))
     aligned.normalized_crs = "EPSG:4326" if output_count else None
     aligned.normalized_count = output_count
     aligned.geometry_type = source_dataset.geometry_type
@@ -1315,6 +1365,11 @@ def field_assignment_reference(project_id: str, assignment_id: str, db: Db, user
         if not attribute:
             continue
         values = attribute.canonical_attributes or attribute.raw_attributes
+        values = dict(values)
+        for field, source_id in (selection.attribute_sources or {}).items():
+            chosen = db.get(SourceFeature, source_id)
+            if chosen:
+                values[field] = (chosen.canonical_attributes or chosen.raw_attributes).get(field)
         from shapely.geometry import mapping as geometry_mapping
         resolved, origin = resolve_canonical_geometry(db, entity.id)
         output.append({"parcel_entity_id": entity.id, "attributes": {key: values.get(key) for key in allowed},
@@ -1406,86 +1461,10 @@ def field_evidence_response(evidence: FieldEvidence) -> dict:
 
 @app.post("/api/projects/{project_id}/query")
 def structured_query(project_id: str, payload: QueryRequest, db: Db, user: CurrentUser):
-    ensure_project_membership(db, project_id, user)
-    plan = parse_structured_query(payload.query)
-    plan["limit"] = payload.limit
-    plan["offset"] = payload.offset
-    if payload.ward:
-        plan["filters"]["ward"] = payload.ward
-    if payload.date_from:
-        plan["filters"]["date_from"] = payload.date_from.isoformat()
-    if payload.date_to:
-        plan["filters"]["date_to"] = payload.date_to.isoformat()
-    if payload.bbox:
-        if payload.bbox[0] > payload.bbox[2] or payload.bbox[1] > payload.bbox[3]:
-            raise HTTPException(422, "bbox must be minx,miny,maxx,maxy")
-        plan["filters"]["bbox"] = payload.bbox
-    if payload.radius_m is not None:
-        if payload.longitude is None or payload.latitude is None:
-            raise HTTPException(422, "longitude and latitude are required with radius_m")
-        plan["filters"].update({"longitude": payload.longitude, "latitude": payload.latitude,
-                                 "radius_m": payload.radius_m})
-    if plan["kind"] == "help":
-        return {"plan": plan, "clarification": "Ask for conflicts by ward, missing links, dated changes, or nearby tasks."}
-    rows: list[dict] = []
-    if plan["kind"] == "conflicts":
-        conflicts_rows = list(db.scalars(select(TopologyConflict).where(TopologyConflict.project_id == project_id)
-                                        .order_by(TopologyConflict.created_at.desc())))
-        rows = [{"id": row.id, "type": row.conflict_type, "severity": row.severity, "description": row.description,
-                 "details": row.details} for row in conflicts_rows]
-        if plan["filters"].get("ward"):
-            ward = plan["filters"]["ward"]
-            rows = [row for row in rows if ward.casefold() in json.dumps(row.get("details", {})).casefold()]
-    elif plan["kind"] == "missing_links":
-        linked = {link.source_feature_id for link in db.scalars(select(ParcelSourceLink).where(ParcelSourceLink.project_id == project_id))}
-        rows = [{"feature_id": feature.id, "dataset_id": feature.dataset_id, "original_id": feature.original_id}
-                for feature in db.scalars(select(SourceFeature).join(Dataset, Dataset.id == SourceFeature.dataset_id)
-                                          .where(Dataset.project_id == project_id, SourceFeature.status == "processed"))
-                if feature.id not in linked]
-    elif plan["kind"] == "area_threshold":
-        threshold = plan["filters"].get("area_threshold")
-        if threshold is None:
-            return {"plan": plan, "filters": plan["filters"], "rows": [], "clarification": plan.get("clarification"), "read_only": True}
-        source_rows = db.scalars(select(SourceFeature).join(Dataset, Dataset.id == SourceFeature.dataset_id)
-                                 .where(Dataset.project_id == project_id, SourceFeature.status == "processed"))
-        for feature in source_rows:
-            values = feature.canonical_attributes or feature.raw_attributes
-            raw_area = values.get("recorded_area", values.get("area", values.get("area_m2")))
-            try:
-                if float(raw_area) >= float(threshold):
-                    if payload.bbox and (not feature.normalized_geometry or
-                        shape(feature.normalized_geometry).bounds[2] < payload.bbox[0] or shape(feature.normalized_geometry).bounds[0] > payload.bbox[2] or
-                        shape(feature.normalized_geometry).bounds[3] < payload.bbox[1] or shape(feature.normalized_geometry).bounds[1] > payload.bbox[3]):
-                        continue
-                    rows.append({"feature_id": feature.id, "dataset_id": feature.dataset_id, "original_id": feature.original_id,
-                                 "area": raw_area, "units": values.get("area_units")})
-            except (TypeError, ValueError):
-                continue
-            if len(rows) >= payload.limit:
-                break
-    elif plan["kind"] == "dated_changes":
-        rows = [{"id": row.id, "type": row.change_type, "status": row.status, "evidence": row.evidence,
-                 "created_at": row.created_at}
-             for row in db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project_id)
-                                      .order_by(ChangeProposal.created_at.desc()))]
-    elif plan["kind"] == "nearby_tasks":
-        ensure_project_access(db, project_id, user, capability="fieldwork")
-        assignment_query = select(FieldAssignment).where(FieldAssignment.project_id == project_id)
-        if user.role == "field":
-            assignment_query = assignment_query.where(FieldAssignment.assignee_id == user.id,
-                                                       FieldAssignment.status.in_(["assigned", "active"]))
-        rows = [assignment_response(row) for row in db.scalars(assignment_query.order_by(FieldAssignment.created_at.desc()))
-                if not utc_expired(row.expires_at)]
-    if payload.ward:
-        rows = [row for row in rows if payload.ward.casefold() in json.dumps(row).casefold()]
-    if payload.date_from or payload.date_to:
-        rows = [row for row in rows if not row.get("created_at") or
-                (not payload.date_from or str(row["created_at"])[:10] >= payload.date_from.isoformat()) and
-                (not payload.date_to or str(row["created_at"])[:10] <= payload.date_to.isoformat())]
-    total = len(rows)
-    rows = rows[payload.offset:payload.offset + payload.limit]
-    return {"plan": plan, "filters": plan["filters"], "rows": rows, "total": total,
-            "offset": payload.offset, "read_only": True, "truncated": payload.offset + len(rows) < total}
+    try:
+        return execute_query(db, project_id, user, payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.post("/api/projects/{project_id}/compliance-rules", status_code=201)
@@ -1725,12 +1704,14 @@ def conflicts(project_id: str, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user)
     return [{"id": c.id, "type": c.conflict_type, "severity": c.severity, "description": c.description,
              "status": c.status, "revision": c.revision, "feature_id": c.feature_id, "dataset_id": c.dataset_id, "details": c.details}
-             for c in db.scalars(select(TopologyConflict).where(TopologyConflict.project_id == project_id))]
+             for c in db.scalars(select(TopologyConflict).where(TopologyConflict.project_id == project_id))
+             if c.dataset_id in readable_dataset_ids(db, project_id, user) or (c.dataset_id is None and len(readable_dataset_ids(db, project_id, user)) == len(list(db.scalars(select(Dataset.id).where(Dataset.project_id == project_id)))))]
 
 
 @app.post("/api/projects/{project_id}/changes/detect")
 def changes(project_id: str, payload: ChangeRequest, db: Db, user: CurrentUser):
     ensure_project_access(db, project_id, user, write=True)
+    ensure_readable_inputs(db, project_id, user, [payload.before_dataset_id, payload.after_dataset_id])
     validate_dataset_pair(db, project_id, payload.before_dataset_id, payload.after_dataset_id)
     require_spatial_ready(validate_dataset(db, project_id, payload.before_dataset_id))
     require_spatial_ready(validate_dataset(db, project_id, payload.after_dataset_id))
@@ -1748,7 +1729,8 @@ def list_changes(project_id: str, db: Db, user: CurrentUser):
              "revision": c.revision, "before_geometry": c.before_geometry, "after_geometry": c.after_geometry,
              "before_attributes": c.before_attributes, "after_attributes": c.after_attributes,
              "affected_neighbors": c.affected_neighbors, "evidence": c.evidence}
-             for c in db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project_id))]
+             for c in db.scalars(select(ChangeProposal).where(ChangeProposal.project_id == project_id))
+             if source_ids_readable(db, project_id, user, [c.source_feature_id, c.comparison_feature_id])]
 
 
 @app.post("/api/projects/{project_id}/reviews/{target_type}/{target_id}")
@@ -1807,6 +1789,8 @@ def list_parcels(project_id: str, db: Db, user: CurrentUser):
     output = []
     for entity in db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id, ParcelEntity.status == "active")):
         members = list(db.scalars(select(ParcelSourceLink.source_feature_id).where(ParcelSourceLink.parcel_entity_id == entity.id)))
+        if not source_ids_readable(db, project_id, user, members):
+            continue
         selected = db.scalar(select(ParcelSelection).where(ParcelSelection.parcel_entity_id == entity.id))
         try:
             geometry, geometry_origin = resolve_canonical_geometry(db, entity.id)
@@ -2155,6 +2139,7 @@ def create_job(project_id: str, job_type: str, payload: dict, background: Backgr
     payload = {**{key: policy[key] for key in ('max_distance','ambiguity_margin','geometry_tolerance')}, **payload,
                'policy_version': policy['version']}
     validate_job_payload(db, project_id, job_type, payload)
+    ensure_readable_inputs(db, project_id, user, [value for key, value in payload.items() if key.endswith("dataset_id")])
     configuration_hash = job_configuration_hash(db, job_type, payload)
     idempotency_key = idempotency_key or configuration_hash
     if idempotency_key:
@@ -2190,6 +2175,7 @@ def retry_job(project_id: str, job_id: str, background: BackgroundTasks, db: Db,
     if job.attempts >= job.max_attempts:
         raise HTTPException(409, "Job has exhausted its bounded retry attempts")
     validate_job_payload(db, project_id, job.job_type, job.payload)
+    ensure_readable_inputs(db, project_id, user, [value for key, value in job.payload.items() if key.endswith("dataset_id")])
     job.status = "queued"
     job.stage = "queued"
     job.cancellation_requested = False
@@ -2236,6 +2222,24 @@ def job_response(job: Job) -> dict:
             "warnings": job.warnings, "cancellation_requested": job.cancellation_requested,
             "lease_expires_at": job.lease_expires_at, "max_attempts": job.max_attempts,
             "created_at": job.created_at, "started_at": job.started_at, "finished_at": job.finished_at}
+
+
+def ensure_readable_inputs(db, project_id, user, dataset_ids):
+    if not set(dataset_ids).issubset(readable_dataset_ids(db, project_id, user)):
+        raise HTTPException(403, "Processing inputs include restricted or unavailable source evidence")
+
+
+def source_ids_readable(db, project_id, user, source_ids):
+    identifiers = {value for value in source_ids if value}
+    sources = list(db.scalars(select(SourceFeature).where(SourceFeature.id.in_(identifiers))))
+    allowed = readable_dataset_ids(db, project_id, user)
+    return len(sources) == len(identifiers) and all(source.dataset_id in allowed for source in sources)
+
+
+def parcel_ids_readable(db, project_id, user, parcel_ids):
+    source_ids = list(db.scalars(select(ParcelSourceLink.source_feature_id).where(
+        ParcelSourceLink.project_id == project_id, ParcelSourceLink.parcel_entity_id.in_(parcel_ids))))
+    return source_ids_readable(db, project_id, user, source_ids)
 
 
 def validate_dataset(db: Session, project_id: str, dataset_id: str) -> Dataset:

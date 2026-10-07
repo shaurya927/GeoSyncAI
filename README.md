@@ -11,6 +11,46 @@ select boundaries and attributes, validate a candidate dataset, publish a versio
 and export its lineage. The application supports reconciliation; it does not
 establish ownership, certify boundaries, or update official government records.
 
+## Final project package / local production preview
+
+The delivery ZIP includes editable source, tests, synthetic inputs, and the built
+web frontend. See `docs/FINAL_ACCEPTANCE.md` for the exact verification record.
+The launcher uses `.local-demo/` for its own database/uploads and preserves any
+existing `backend/geosyncai.db` and `backend/storage`.
+
+Windows PowerShell, from the extracted project folder:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+.\.venv\Scripts\python.exe scripts/run_local.py --seed-demo
+```
+
+Linux/WSL with Python 3.12:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python scripts/run_local.py --seed-demo
+```
+
+Open `http://127.0.0.1:5173`. For the isolated demo, sign in with `admin` / `admin`.
+All actions use the real FastAPI backend; local processing uses the real local job
+runner and SQLite. Production PostGIS/Redis/Celery remain available through Compose.
+Use `--api-port 8001 --web-port 5174` if the default ports are occupied.
+
+After source changes, use `python scripts/run_local.py --build` with Node 22/npm
+installed. A Git clone without prebuilt assets also builds them automatically.
+Stop with Ctrl+C, or run `python scripts/stop_local.py` in the same Python environment.
+Database/uploads persist between launches. Never include `.local-demo/` or `.env`
+when sharing the project.
+
+For a repeatable demonstration, use `demo_inputs/README.md`. The supplied concave
+surveys and revenue CSV deliberately contain competing recorded areas. Review
+explicit source choices, draw a cut, approve split/merge, validate and publish.
+Use the production launcher for offline reload tests; the Vite development server
+does not register the production service worker.
+
 ## Linux / WSL startup
 
 Use Python **3.12** and Node **22**. Python packages are pinned in

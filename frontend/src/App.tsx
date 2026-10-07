@@ -3,6 +3,11 @@ import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import * as api from './api'
 import * as w from './workflowApi'
+import FieldworkPanel from './FieldworkPanel'
+import GeometryEditor from './GeometryEditor'
+import RegistryTools from './RegistryTools'
+import QueryPanel from './QueryPanel'
+import { cachedSession, clearSession, saveSession, tokenExpiry, type Capabilities } from './session'
 
 type View = 'overview' | 'datasets' | 'review' | 'alerts' | 'versions' | 'fieldwork' | 'geometry' | 'queries' | 'compliance'
 const titles: Record<View, string> = { overview: 'Overview', datasets: 'Datasets', review: 'Review queue', alerts: 'Change alerts', versions: 'Versions & history', fieldwork: 'Fieldwork / citizen', geometry: 'Boundary editor', queries: 'Read-only queries', compliance: 'Compliance screening' }
@@ -11,34 +16,6 @@ const format = (value: unknown) => JSON.stringify(value, null, 2)
 const label = (feature?: w.Feature) => feature?.original_id || feature?.id || 'Unavailable'
 function Brand() { return <div className="brand"><span className="brand-symbol"><span /><span /><span /><span /></span>GeoSync<span className="brand-accent">AI</span></div> }
 function Json({ value }: { value: unknown }) { return <pre className="json-preview">{format(value)}</pre> }
-
-function geometryCoordinates(geometry: GeoJSON.Geometry): number[][] {
-  const points: number[][] = []
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value) && typeof value[0] === 'number' && typeof value[1] === 'number') points.push(value as number[])
-    else if (Array.isArray(value)) value.forEach(visit)
-  }
-  if ('coordinates' in geometry) visit(geometry.coordinates)
-  return points
-}
-function translateGeometry(geometry: GeoJSON.Geometry, dx: number, dy: number): GeoJSON.Geometry {
-  if (!('coordinates' in geometry)) return geometry
-  const translate = (value: unknown): unknown => Array.isArray(value) && typeof value[0] === 'number' && typeof value[1] === 'number'
-    ? [value[0] + dx, value[1] + dy, ...value.slice(2)] : Array.isArray(value) ? value.map(translate) : value
-  return { ...geometry, coordinates: translate(geometry.coordinates) as GeoJSON.Position[] } as GeoJSON.Geometry
-}
-function rectangleParts(geometry: GeoJSON.Geometry): Record<string, GeoJSON.Geometry> {
-  const points = geometryCoordinates(geometry); if (!points.length) return {}
-  const xs = points.map(point => point[0]); const ys = points.map(point => point[1])
-  const minX = Math.min(...xs); const maxX = Math.max(...xs); const minY = Math.min(...ys); const maxY = Math.max(...ys); const midX = (minX + maxX) / 2
-  const polygon = (left: number, right: number): GeoJSON.Geometry => ({ type: 'Polygon', coordinates: [[[left, minY], [right, minY], [right, maxY], [left, maxY], [left, minY]]] })
-  return { left: polygon(minX, midX), right: polygon(midX, maxX) }
-}
-function envelope(geometries: GeoJSON.Geometry[]): GeoJSON.Geometry | null {
-  const points = geometries.flatMap(geometryCoordinates); if (!points.length) return null
-  const xs = points.map(point => point[0]); const ys = points.map(point => point[1]); const minX = Math.min(...xs); const maxX = Math.max(...xs); const minY = Math.min(...ys); const maxY = Math.max(...ys)
-  return { type: 'Polygon', coordinates: [[[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY], [minX, minY]]] }
-}
 
 function PolicyEditor({ project, enabled, run }: { project: string; enabled: boolean; run: (action: () => Promise<void>) => void }) {
   const [policy, setPolicy] = useState('')
@@ -175,7 +152,7 @@ function DatasetInspector({ project, dataset, writable, reviewable, refresh, run
   const [classification, setClassification] = useState(dataset.access_classification || 'internal')
   const [metadataJson, setMetadataJson] = useState(JSON.stringify({ accuracy_metadata: dataset.accuracy_metadata || {}, provenance: dataset.provenance || {}, administrative_namespace: dataset.administrative_namespace || {} }, null, 2))
   const path = `${w.projectPath(project)}/datasets/${dataset.id}`
-  useEffect(() => { void Promise.all([w.get<w.Feature[]>(`${path}/features`), w.get<w.Mapping>(`${path}/mapping`)])
+  useEffect(() => { void Promise.all([w.datasetFeatures(project, dataset.id), w.get<w.Mapping>(`${path}/mapping`)])
     .then(([items, item]) => { setFeatures(items); setMapping(item) }).catch(e => setError(String(e))) }, [path, dataset])
   useEffect(() => { void w.get<typeof templates>(`${w.projectPath(project)}/mapping-templates`).then(setTemplates).catch(e => setError(String(e))) }, [project, dataset])
   return <section className="panel inspector"><h2>{dataset.name}</h2>{error && <p role="alert">{error}</p>}
@@ -226,52 +203,6 @@ function Baseline({ parcel, features, project, canReview, refresh, run }: { parc
   </form>
 }
 
-function GeometryEditor({ project, parcels, writable, canReview, refresh, run }: { project: string; parcels: w.Parcel[]; writable: boolean; canReview: boolean; refresh: () => Promise<void>; run: (action: () => Promise<void>) => void }) {
-  const [operation, setOperation] = useState<'move' | 'split' | 'merge' | 'shared_edge'>('move')
-  const [participants, setParticipants] = useState<string[]>([])
-  const [draft, setDraft] = useState<Record<string, GeoJSON.Geometry>>({})
-  const [history, setHistory] = useState<Record<string, GeoJSON.Geometry>[]>([])
-  const [rationale, setRationale] = useState('')
-  const [changes, setChanges] = useState<w.GeometryChange[]>([])
-  const [error, setError] = useState('')
-  const load = useCallback(async () => { setChanges(await w.get<w.GeometryChange[]>(`${w.projectPath(project)}/geometry-changes`)) }, [project])
-  useEffect(() => { void load().catch(e => setError(String(e))) }, [load])
-  const selected = parcels.filter(parcel => participants.includes(parcel.id))
-  const pushDraft = (next: Record<string, GeoJSON.Geometry>) => { setHistory(previous => [...previous.slice(-9), draft]); setDraft(next) }
-  const choose = (id: string) => setParticipants(current => current.includes(id) ? current.filter(value => value !== id) : operation === 'move' ? [id] : [...current, id].slice(-2))
-  const seedDraft = () => {
-    if (!selected.length) return
-    if (operation === 'move' || operation === 'shared_edge') {
-      pushDraft(Object.fromEntries(selected.map(parcel => [parcel.id, parcel.geometry]).filter((entry): entry is [string, GeoJSON.Geometry] => Boolean(entry[1]))))
-    } else if (operation === 'split' && selected[0]?.geometry) pushDraft(rectangleParts(selected[0].geometry))
-    else if (operation === 'merge') { const merged = envelope(selected.map(parcel => parcel.geometry).filter((geometry): geometry is GeoJSON.Geometry => Boolean(geometry))); if (merged) pushDraft({ merged }) }
-  }
-  const nudge = (dx: number, dy: number) => { const id = participants[0]; const geometry = id ? draft[id] || parcels.find(parcel => parcel.id === id)?.geometry : undefined; if (!id || !geometry) return; pushDraft({ ...draft, [id]: translateGeometry(geometry, dx, dy) }) }
-  const submit = () => run(async () => {
-    if (!participants.length || !Object.keys(draft).length || !rationale.trim()) throw new Error('Select parcels, create a draft, and provide a rationale')
-    await w.post(`${w.projectPath(project)}/geometry-changes`, { operation, parcel_entity_ids: participants, draft_geometries: draft,
-      attribute_source_id: operation === 'split' || operation === 'merge' ? selected[0]?.selection?.attribute_source_id : undefined, rationale })
-    setDraft({}); setHistory([]); setRationale(''); await load(); await refresh()
-  })
-  const approve = (change: w.GeometryChange, decision: 'approved' | 'rejected' | 'deferred') => run(async () => { await w.post(`${w.projectPath(project)}/geometry-changes/${change.id}/decision`, { decision, expected_revision: change.revision, rationale: `Officer ${decision} this reviewed geometry draft` }); await load(); await refresh() })
-  const preview: w.Feature[] = selected.map(parcel => ({ id: parcel.id, original_id: parcel.id, attributes: {}, geometry: draft[parcel.id] || parcel.geometry || null, original_geometry: parcel.geometry || null, status: 'draft' }))
-  Object.entries(draft).filter(([id]) => !participants.includes(id)).forEach(([id, geometry]) => preview.push({ id, original_id: id, attributes: {}, geometry, original_geometry: null, status: 'draft' }))
-  return <><section className="panel inspector"><h2>Boundary editor</h2><p>Drafts are preview-only until reviewed. Server-side topology, area, lineage, project scope, expected revisions, and publication gates remain authoritative.</p>{error && <p role="alert">{error}</p>}
-    <label>Operation<select value={operation} onChange={e => { setOperation(e.target.value as typeof operation); setParticipants([]); setDraft({}); setHistory([]) }}><option value="move">Move / vertex edit</option><option value="split">Split one parcel</option><option value="merge">Merge selected parcels</option><option value="shared_edge">Shared-edge edit</option></select></label>
-    <div className="record-preview">{parcels.map(parcel => <label key={parcel.id}><input type="checkbox" checked={participants.includes(parcel.id)} onChange={() => choose(parcel.id)} /> {parcel.id.slice(0, 12)} · {parcel.geometry_origin?.kind ? String(parcel.geometry_origin.kind) : 'geometry unavailable'}</label>)}</div>
-    <div className="title-actions"><button className="button button-secondary" disabled={!participants.length} onClick={seedDraft}>Create draft geometry</button><button className="button button-secondary" disabled={!history.length} onClick={() => { const previous = history[history.length - 1]; setHistory(history.slice(0, -1)); setDraft(previous || {}) }}>Undo draft edit</button><button className="button button-secondary" disabled={!Object.keys(draft).length} onClick={() => { setDraft({}); setHistory([]) }}>Cancel draft</button></div>
-    {operation === 'move' && <div className="title-actions"><button className="button button-secondary" onClick={() => nudge(-0.00005, 0)}>Nudge west</button><button className="button button-secondary" onClick={() => nudge(0.00005, 0)}>Nudge east</button><button className="button button-secondary" onClick={() => nudge(0, 0.00005)}>Nudge north</button><button className="button button-secondary" onClick={() => nudge(0, -0.00005)}>Nudge south</button></div>}
-    <label>Draft GeoJSON<textarea rows={10} value={JSON.stringify(draft, null, 2)} onChange={e => { try { setDraft(JSON.parse(e.target.value) as Record<string, GeoJSON.Geometry>); setError('') } catch { setError('Draft JSON is not valid GeoJSON geometry') } }} /></label>
-    <label>Submission rationale<input required value={rationale} onChange={e => setRationale(e.target.value)} /></label><button className="button button-primary" disabled={!writable || !Object.keys(draft).length} onClick={submit}>Submit geometry draft</button></section>
-    {preview.length > 0 && <ParcelMap features={preview} onSelect={() => undefined} />}
-    <section className="panel inspector"><h3>Submitted geometry changes</h3>{!changes.length && <p>No geometry drafts have been submitted.</p>}{changes.map(change => <details key={change.id}><summary>{change.operation} · {change.status} · revision {change.revision}</summary><Json value={change} />{change.status === 'draft' && <div className="title-actions"><button className="button button-primary" disabled={!canReview} onClick={() => approve(change, 'approved')}>Approve</button><button className="button button-secondary" disabled={!canReview} onClick={() => approve(change, 'deferred')}>Defer</button><button className="button button-secondary" disabled={!canReview} onClick={() => approve(change, 'rejected')}>Reject</button></div>}</details>)}</section></>
-}
-
-function QueryPanel({ project, run }: { project: string; run: (action: () => Promise<void>) => void }) {
-  const [query, setQuery] = useState('show conflicts in ward W-1'); const [result, setResult] = useState<Record<string, unknown>>()
-  return <section className="panel inspector"><h2>Read-only spatial query</h2><p>Deterministic Hindi/English parser; interpreted intent and filters are shown before any result is used. Queries cannot mutate records.</p><form onSubmit={e => { e.preventDefault(); run(async () => setResult(await w.post<Record<string, unknown>>(`${w.projectPath(project)}/query`, { query, limit: 100 }))) }}><label>Query<input value={query} onChange={e => setQuery(e.target.value)} placeholder="conflicts in ward W-1 / missing links / nearby tasks" /></label><button className="button button-primary">Run bounded query</button></form>{result && <Json value={result} />}</section>
-}
-
 function RasterPanel({ project, writable, run }: { project: string; writable: boolean; run: (action: () => Promise<void>) => void }) {
   const [assets, setAssets] = useState<w.RasterAsset[]>([]); const [file, setFile] = useState<File>(); const [crs, setCrs] = useState(''); const [attribution, setAttribution] = useState(''); const [preview, setPreview] = useState<Record<string, string>>({})
   const load = useCallback(async () => setAssets(await w.get<w.RasterAsset[]>(`${w.projectPath(project)}/raster-assets`)), [project])
@@ -281,13 +212,14 @@ function RasterPanel({ project, writable, run }: { project: string; writable: bo
   return <section className="panel inspector"><h2>GeoTIFF registry and preview</h2><p>Uploads are inspected with rasterio for CRS, bounds, dimensions, bands, resolution, nodata, transform, hash, and provenance. Unknown CRS remains blocked from preview.</p><label>GeoTIFF<input type="file" accept=".tif,.tiff" onChange={e => setFile(e.target.files?.[0])} /></label><label>Fallback CRS only when the file has no CRS<input value={crs} onChange={e => setCrs(e.target.value)} placeholder="EPSG:32643" /></label><label>Attribution<input value={attribution} onChange={e => setAttribution(e.target.value)} /></label><button className="button button-secondary" disabled={!writable || !file} onClick={upload}>Inspect and register raster</button>{assets.map(asset => <div className="source-row" key={asset.id}><div><strong>{asset.name}</strong><div>{asset.status} · {asset.source_crs || 'Unknown CRS'} · {asset.metadata.width as number}×{asset.metadata.height as number} · {asset.metadata.count as number} band(s)</div><small>{asset.content_hash}</small></div><button className="button button-secondary" onClick={() => show(asset.id)}>Preview</button>{preview[asset.id] && <img className="raster-preview" src={preview[asset.id]} alt={`Preview of ${asset.name}`} />}</div>)}</section>
 }
 
-function GroundControlPanel({ project, datasets, writable, canReview, run }: { project: string; datasets: w.Dataset[]; writable: boolean; canReview: boolean; run: (action: () => Promise<void>) => void }) {
+function GroundControlPanel({ project, datasets, writable, canReview, refresh, run }: { project: string; datasets: w.Dataset[]; writable: boolean; canReview: boolean; refresh: () => Promise<void>; run: (action: () => Promise<void>) => void }) {
+  const [approvalReasons, setApprovalReasons] = useState<Record<string, string>>({})
   const [dataset, setDataset] = useState(''); const [method, setMethod] = useState('similarity'); const [sourceCrs, setSourceCrs] = useState('EPSG:4326'); const [targetCrs, setTargetCrs] = useState('EPSG:4326'); const [threshold, setThreshold] = useState('1'); const [points, setPoints] = useState('[{"source":[73,20],"target":[73,20]},{"source":[74,20],"target":[74,20]},{"source":[73,21],"target":[73,21]},{"source":[74,21],"target":[74,21],"checkpoint":true}]'); const [sessions, setSessions] = useState<w.GroundControlSession[]>([])
   const load = useCallback(async () => setSessions(await w.get<w.GroundControlSession[]>(`${w.projectPath(project)}/ground-control`)), [project])
   useEffect(() => { void load() }, [load])
   const create = () => run(async () => { await w.post(`${w.projectPath(project)}/ground-control`, { dataset_id: dataset, method, source_crs: sourceCrs, target_crs: targetCrs, max_checkpoint_residual: Number(threshold), control_points: JSON.parse(points) }); await load() })
-  const approve = (session: w.GroundControlSession) => run(async () => { await w.post(`${w.projectPath(project)}/ground-control/${session.id}/approve`, { expected_revision: session.revision, rationale: 'Officer reviewed independent checkpoints and coverage evidence' }); await load() })
-  return <section className="panel inspector"><h2>Ground-control alignment</h2><p>Fit and checkpoint controls are entered separately; checkpoint residuals never participate in fitting. Approval creates a normalized dataset version while retaining original bytes and coordinates.</p><label>Source dataset<select value={dataset} onChange={e => setDataset(e.target.value)}><option value="">Choose dataset</option>{datasets.filter(item => item.declared_crs).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Method<select value={method} onChange={e => setMethod(e.target.value)}><option>translation</option><option>similarity</option><option>affine</option></select></label><label>Source CRS<input value={sourceCrs} onChange={e => setSourceCrs(e.target.value)} /></label><label>Target CRS<input value={targetCrs} onChange={e => setTargetCrs(e.target.value)} /></label><label>Checkpoint max residual<input type="number" value={threshold} onChange={e => setThreshold(e.target.value)} /></label><label>Controls JSON<textarea rows={8} value={points} onChange={e => setPoints(e.target.value)} /></label><button className="button button-secondary" disabled={!writable || !dataset} onClick={create}>Fit controls</button>{sessions.map(session => <details key={session.id}><summary>{session.method} · {session.status} · checkpoints {String(session.residuals['checkpoint_count'] || 0)}</summary><Json value={session} />{session.status === 'draft' && <button className="button button-primary" disabled={!canReview} onClick={() => approve(session)}>Approve alignment</button>}</details>)}</section>
+  const approve = (session: w.GroundControlSession) => run(async () => { await w.post(`${w.projectPath(project)}/ground-control/${session.id}/approve`, { expected_revision: session.revision, rationale: approvalReasons[session.id] }); await load(); await refresh() })
+  return <section className="panel inspector"><h2>Ground-control alignment</h2><p>Fit and checkpoint controls are entered separately; checkpoint residuals never participate in fitting. Residuals and thresholds are in metres even for degrees/feet target CRS. All source geometry must lie within the validated control/checkpoint hull; extrapolation is blocked. Approval creates a normalized dataset version while retaining original bytes and coordinates.</p><label>Source dataset<select aria-label="Source dataset" value={dataset} onChange={e => { setDataset(e.target.value); setSourceCrs(datasets.find(d => d.id === e.target.value)?.declared_crs || '') }}><option value="">Choose dataset</option>{datasets.filter(item => item.declared_crs).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Method<select value={method} onChange={e => setMethod(e.target.value)}><option>translation</option><option>similarity</option><option>affine</option></select></label><label>Source CRS<input value={sourceCrs} onChange={e => setSourceCrs(e.target.value)} /></label><label>Target CRS<input value={targetCrs} onChange={e => setTargetCrs(e.target.value)} /></label><label>Checkpoint max residual (metres)<input type="number" min="0.001" step="any" value={threshold} onChange={e => setThreshold(e.target.value)} /></label><label>Controls JSON<textarea rows={8} value={points} onChange={e => setPoints(e.target.value)} /></label><button className="button button-secondary" disabled={!writable || !dataset} onClick={create}>Fit controls</button>{sessions.map(session => <details key={session.id}><summary>{session.method} · {session.status} · checkpoints {String(session.residuals['checkpoint_count'] || 0)}</summary><Json value={session} />{session.status === 'draft' && <><p>Independent maximum: {Number(session.residuals.checkpoint_max || 0).toFixed(3)} m · coverage: {String((session.residuals.coverage as Record<string,unknown> | undefined)?.covers_source)}</p><label>Alignment approval rationale<input value={approvalReasons[session.id] || ''} onChange={e => setApprovalReasons({ ...approvalReasons, [session.id]: e.target.value })} /></label><button className="button button-primary" disabled={!canReview || !approvalReasons[session.id]?.trim() || !session.residuals.checkpoint_count || !(session.residuals.coverage as Record<string,unknown> | undefined)?.covers_source || Number(session.residuals.checkpoint_max) > Number(session.residuals.max_checkpoint_residual_threshold)} onClick={() => approve(session)}>Approve alignment</button></>}</details>)}</section>
 }
 
 function CompliancePanel({ project, parcels, writable, canReview, run }: { project: string; parcels: w.Parcel[]; writable: boolean; canReview: boolean; run: (action: () => Promise<void>) => void }) {
@@ -311,105 +243,6 @@ function OperationsPanel({ project, parcels, run }: { project: string; parcels: 
   return <section className="panel inspector"><h2>Assignment and public-access administration</h2><p>Lifecycle actions are server-authorized, project-scoped, expiry-aware, and audited. Frozen citizen grants reference a published version.</p><h3>Field assignment</h3><label>Field officer<select value={assignee} onChange={e => setAssignee(e.target.value)}><option value="">Choose officer</option>{members.filter(member => ['field', 'processor', 'reviewer'].includes(member.role)).map(member => <option key={member.id} value={member.id}>{member.username} · {member.role}</option>)}</select></label><label>Parcel<select value={assignmentParcel} onChange={e => setAssignmentParcel(e.target.value)}><option value="">Choose parcel</option>{parcels.map(item => <option key={item.id}>{item.id}</option>)}</select></label><button className="button button-secondary" onClick={submitAssignment}>Create assignment</button>{assignments.map(item => <div className="source-row" key={item.id}><span>{item.id.slice(0, 8)} · {item.status} · {item.parcel_entity_ids.length} parcel(s)</span>{item.status !== 'revoked' && <button className="button button-secondary" onClick={() => revokeAssignment(item)}>Revoke</button>}</div>)}<h3>Citizen grant</h3><label>Citizen username<select value={citizen} onChange={e => setCitizen(e.target.value)}><option value="">Choose citizen</option>{members.filter(member => member.role === 'citizen').map(member => <option key={member.username}>{member.username}</option>)}</select></label><label>Published parcel<select value={grantParcel} onChange={e => setGrantParcel(e.target.value)}><option value="">Choose parcel</option>{parcels.map(item => <option key={item.id}>{item.id}</option>)}</select></label><label>Allowed fields<input value={grantFields} onChange={e => setGrantFields(e.target.value)} /></label><button className="button button-secondary" onClick={submitGrant}>Create frozen grant</button>{grants.map(item => <div className="source-row" key={item.id}><span>{item.id.slice(0, 8)} · {item.status} · version {item.published_version_id?.slice(0, 8) || 'legacy'}</span>{item.status === 'active' && <button className="button button-secondary" onClick={() => revokeGrant(item)}>Revoke</button>}</div>)}<h3>Citizen cases</h3>{!cases.length && <p>No citizen cases require a response.</p>}{cases.map(item => <div className="panel inspector" key={item.id}><strong>{item.category} · {item.status}</strong><p>{item.description}</p><textarea rows={3} value={caseReply[item.id] || item.response || ''} onChange={e => setCaseReply({ ...caseReply, [item.id]: e.target.value })} placeholder="Officer response" /><button className="button button-secondary" disabled={item.status === 'resolved' || item.status === 'closed'} onClick={() => respond(item)}>Respond and resolve</button></div>)}</section>
 }
 
-type OfflineDraft = { assignment_id: string; parcel_entity_id: string; client_event_id: string; expected_project_revision: number; payload: Record<string, unknown>; server_evidence_id?: string }
-function FieldworkPanel({ project, user, run }: { project: string; user: w.User; run: (action: () => Promise<void>) => void }) {
-  const MAX_DRAFTS = 50
-  const MAX_PHOTO_BYTES = 5 * 1024 * 1024
-  const MAX_QUEUE_BYTES = 10 * 1024 * 1024
-  const [assignments, setAssignments] = useState<w.FieldAssignment[]>([])
-  const [queue, setQueue] = useState<OfflineDraft[]>([])
-  const [selected, setSelected] = useState<w.FieldAssignment>()
-  const [parcel, setParcel] = useState('')
-  const [note, setNote] = useState('')
-  const [photo, setPhoto] = useState<string>()
-  const [online, setOnline] = useState(navigator.onLine)
-  const [message, setMessage] = useState('')
-  const queueKey = `geosyncai-field-queue-${project}-${user.id}`
-  const load = useCallback(async () => {
-    let result: w.FieldAssignment[] = []
-    try {
-      result = await w.get<w.FieldAssignment[]>(`${w.projectPath(project)}/field-assignments`)
-      localStorage.setItem(`geosyncai-field-assignments-${project}-${user.id}`, JSON.stringify(result))
-      const projectState = await w.get<w.Project>(w.projectPath(project))
-      localStorage.setItem(`geosyncai-project-revision-${project}`, String(projectState.workflow_revision || 0))
-    } catch {
-      try { result = JSON.parse(localStorage.getItem(`geosyncai-field-assignments-${project}-${user.id}`) || '[]') as w.FieldAssignment[] } catch { result = [] }
-    }
-    setAssignments(result); if (!selected && result[0]) setSelected(result[0])
-    try { setQueue(JSON.parse(localStorage.getItem(queueKey) || '[]') as OfflineDraft[]) } catch { setQueue([]) }
-  }, [project, queueKey, selected])
-  useEffect(() => { void load() }, [load])
-  const persist = (next: OfflineDraft[]) => {
-    const serialized = JSON.stringify(next)
-    if (next.length > MAX_DRAFTS || new Blob([serialized]).size > MAX_QUEUE_BYTES) {
-      setMessage(`Device queue limit reached (${MAX_DRAFTS} drafts / ${Math.round(MAX_QUEUE_BYTES / 1024 / 1024)} MB). Export or resolve queued evidence first.`)
-      return false
-    }
-    try { localStorage.setItem(queueKey, serialized); setQueue(next); return true }
-    catch { setMessage('Device storage quota was exceeded. Export or clear queued drafts deliberately before continuing.'); return false }
-  }
-  const exportQueue = () => {
-    const blob = new Blob([JSON.stringify(queue, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `geosyncai-field-queue-${project}.json`; anchor.click(); URL.revokeObjectURL(url)
-  }
-  const clearDeviceData = () => {
-    if (!window.confirm('Clear assignments and queued drafts from this device? Export unresolved drafts first.')) return
-    localStorage.removeItem(queueKey); localStorage.removeItem(`geosyncai-field-assignments-${project}-${user.id}`); localStorage.removeItem(`geosyncai-project-revision-${project}`); setQueue([]); setAssignments([]); setMessage('Device fieldwork data was deliberately cleared.')
-  }
-  const sync = useCallback(async () => {
-    if (!navigator.onLine) return
-    const current = [...queue]
-    const remaining: OfflineDraft[] = []
-    for (const draft of current) {
-      try {
-        const result = await w.post<w.FieldEvidence>(`${w.projectPath(project)}/field-assignments/${draft.assignment_id}/evidence`, draft)
-        if (result.status === 'revision_conflict') { remaining.push({ ...draft, server_evidence_id: result.id }); setMessage('A project revision changed. Your draft remains queued for officer resolution.') }
-      } catch { remaining.push(draft) }
-    }
-    persist(remaining)
-  }, [project, queue, queueKey])
-  const resolveConflict = (draft: OfflineDraft) => run(async () => {
-    if (!draft.server_evidence_id) throw new Error('Sync the draft once before resolving its revision conflict')
-    const nextRevision = Number(localStorage.getItem(`geosyncai-project-revision-${project}`) || 0)
-    const result = await w.post<w.FieldEvidence>(`${w.projectPath(project)}/field-assignments/${draft.assignment_id}/evidence/${draft.server_evidence_id}/resolve`, {
-      expected_revision: draft.expected_project_revision, decision: 'resubmit', rationale: 'Officer reviewed the retained offline draft', new_expected_project_revision: nextRevision })
-    if (result.status === 'submitted') persist(queue.filter(item => item.client_event_id !== draft.client_event_id))
-    else persist(queue.map(item => item.client_event_id === draft.client_event_id ? { ...item, server_evidence_id: result.id, expected_project_revision: nextRevision } : item))
-  })
-  useEffect(() => { const onlineHandler = () => { setOnline(true); void sync() }; const offlineHandler = () => setOnline(false)
-    window.addEventListener('online', onlineHandler); window.addEventListener('offline', offlineHandler)
-    return () => { window.removeEventListener('online', onlineHandler); window.removeEventListener('offline', offlineHandler) }
-  }, [sync])
-  const submit = () => run(async () => {
-    if (!selected || !parcel || !note.trim()) throw new Error('Choose an assigned parcel and enter a field note')
-    const projectRevision = Number(localStorage.getItem(`geosyncai-project-revision-${project}`) || 0)
-    const position = await new Promise<GeolocationPosition | undefined>(resolve => {
-      if (!navigator.geolocation) return resolve(undefined)
-      navigator.geolocation.getCurrentPosition(resolve, () => resolve(undefined), { enableHighAccuracy: true, timeout: 5000 })
-    })
-    const draft: OfflineDraft = { assignment_id: selected.id, parcel_entity_id: parcel,
-      client_event_id: crypto.randomUUID(), expected_project_revision: projectRevision,
-      payload: { note, photo_data_url: photo || null, captured_at: new Date().toISOString(),
-        location: position ? { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy_m: position.coords.accuracy, timestamp: position.timestamp } : null } }
-    if (!navigator.onLine) { if (persist([...queue, draft])) setMessage('Stored in the browser device queue; it is not an encrypted secure vault. Reconnect to sync.'); return }
-    const result = await w.post<w.FieldEvidence>(`${w.projectPath(project)}/field-assignments/${selected.id}/evidence`, draft)
-    if (result.status === 'revision_conflict') { persist([...queue, draft]); setMessage('Revision conflict: draft retained locally for resolution.') }
-    else setMessage('Evidence synced once with an idempotent client event.')
-    setNote(''); setPhoto('')
-  })
-  return <section className="panel inspector"><h2>Authorized fieldwork</h2><p>Bounded assignments only · <strong>{online ? 'Online' : 'Offline'}</strong> · queued drafts: {queue.length}</p>
-    {message && <p role="status" className="notice-banner">{message}</p>}
-    {!assignments.length && <p>No assignment has been explicitly issued to this account.</p>}
-    {assignments.length > 0 && <><label>Assignment<select value={selected?.id || ''} onChange={e => setSelected(assignments.find(item => item.id === e.target.value))}>{assignments.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.status}</option>)}</select></label>
-      <label>Assigned parcel<select value={parcel} onChange={e => setParcel(e.target.value)}><option value="">Choose parcel</option>{selected?.parcel_entity_ids.map(id => <option key={id}>{id}</option>)}</select></label>
-      <label>Field note<textarea value={note} onChange={e => setNote(e.target.value)} placeholder="Observation; this does not approve a boundary" /></label>
-      <label>Photo evidence<input type="file" accept="image/*" capture="environment" onChange={e => { const file = e.target.files?.[0]; if (!file) return; if (file.size > MAX_PHOTO_BYTES) { setMessage('Photo exceeds the 5 MB device-evidence limit.'); return } const reader = new FileReader(); reader.onerror = () => setMessage('Photo could not be read within the device storage limit.'); reader.onload = () => setPhoto(String(reader.result)); reader.readAsDataURL(file) }} /></label>
-      <button className="button button-primary" disabled={!selected || !parcel || !note.trim()} onClick={submit}>{online ? 'Submit evidence' : 'Save offline draft'}</button>
-      {queue.length > 0 && <><button className="button button-secondary" onClick={() => run(sync)}>Retry queued sync</button><button className="button button-secondary" onClick={exportQueue}>Export queued drafts</button>{queue.filter(item => item.server_evidence_id).map(item => <button key={item.client_event_id} className="button button-secondary" onClick={() => resolveConflict(item)}>Resolve revision conflict</button>)}</>}
-      <button className="button button-secondary" onClick={clearDeviceData}>Clear this account’s device data</button></>}
-  </section>
-}
-
 function CitizenPanel({ project, run }: { project: string; run: (action: () => Promise<void>) => void }) {
   const [records, setRecords] = useState<Record<string, unknown>[]>([])
   const [cases, setCases] = useState<Record<string, unknown>[]>([])
@@ -423,22 +256,12 @@ function CitizenCaseForm({ project, records, run, onSubmitted }: { project: stri
   return <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { await w.post(`${w.projectPath(project)}/citizen-cases`, { parcel_entity_id: parcel, category, description }); setDescription(''); await onSubmitted() }) }}><h2>Submit a discrepancy</h2><label>Granted parcel<select required value={parcel} onChange={e => setParcel(e.target.value)}><option value="">Choose</option>{records.map(record => <option key={String(record.parcel_entity_id)}>{String(record.parcel_entity_id)}</option>)}</select></label><label>Category<select value={category} onChange={e => setCategory(e.target.value)}><option>evidence</option><option>discrepancy</option><option>dispute</option><option>status</option></select></label><label>Description<textarea required value={description} onChange={e => setDescription(e.target.value)} /></label><button className="button button-primary">Submit audited case</button></form>
 }
 
-function RegistryTools({ project, features, writable, run }: { project: string; features: w.Feature[]; writable: boolean; run: (action: () => Promise<void>) => void }) {
-  const [chosen, setChosen] = useState<string[]>([])
-  const [term, setTerm] = useState(''); const [canonical, setCanonical] = useState('parcel_id'); const [rationale, setRationale] = useState('')
-  const [cases, setCases] = useState<Record<string, unknown>[]>([]); const [dictionary, setDictionary] = useState<Record<string, unknown>[]>([]); const [rankers, setRankers] = useState<w.ModelArtifact[]>([])
-  const refresh = useCallback(async () => { const [c, d, r] = await Promise.all([w.get<Record<string, unknown>[]>(`${w.projectPath(project)}/reconciliations`), w.get<Record<string, unknown>[]>(`${w.projectPath(project)}/mapping-dictionary`), w.get<w.ModelArtifact[]>(`${w.projectPath(project)}/ranker`)]); setCases(c); setDictionary(d); setRankers(r) }, [project])
-  useEffect(() => { void refresh() }, [refresh])
-  const toggle = (id: string) => setChosen(current => current.includes(id) ? current.filter(value => value !== id) : current.length < 5 ? [...current, id] : current)
-  return <section className="panel inspector"><h2>Source harmonization tools</h2><p>Select one feature from at least three distinct datasets. Recommendations explain agreement and competing values; they do not create identity links.</p>
-    <div className="record-preview">{features.slice(0, 300).map(feature => <label key={feature.id}><input type="checkbox" checked={chosen.includes(feature.id)} onChange={() => toggle(feature.id)} /> {label(feature)} · {feature.dataset_name}</label>)}</div>
-    <button className="button button-secondary" disabled={!writable || chosen.length < 3} onClick={() => run(async () => { await w.post(`${w.projectPath(project)}/reconciliations`, { source_feature_ids: chosen, rationale: 'Officer requested explicit multi-source comparison' }); await refresh() })}>Compare {chosen.length} independent sources</button>
-    <details><summary>Hindi / English reviewed dictionary</summary><form onSubmit={e => { e.preventDefault(); run(async () => { await w.post(`${w.projectPath(project)}/mapping-dictionary`, { canonical_field: canonical, source_term: term, language: /[\u0900-\u097F]/.test(term) ? 'hi' : 'en', normalized_term: term, rationale, confirm: true }); setTerm(''); setRationale(''); await refresh() }) }}><label>Canonical field<select value={canonical} onChange={e => setCanonical(e.target.value)}>{canonicalFields.map(field => <option key={field}>{field}</option>)}</select></label><label>Source term<input required value={term} onChange={e => setTerm(e.target.value)} placeholder="खसरा संख्या / Khasra No" /></label><label>Rationale<input required value={rationale} onChange={e => setRationale(e.target.value)} /></label><button className="button button-secondary" disabled={!writable}>Save reviewed term</button></form><Json value={dictionary} /></details>
-     <details><summary>Reconciliation cases ({cases.length})</summary><Json value={cases} /></details><details><summary>Reviewed ranker artifacts ({rankers.length})</summary>{rankers.map(rank => <div className="source-row" key={rank.id}><span>{rank.version} · {rank.activation_status || 'inactive'} · validation {String(((rank.metrics['splits'] as Record<string, unknown> | undefined)?.['validation']) || 'not supplied')}</span><button className="button button-secondary" disabled={!writable} onClick={() => run(async () => { await w.post(`${w.projectPath(project)}/ranker/${rank.id}/activation`, { active: rank.activation_status !== 'active' }); await refresh() })}>{rank.activation_status === 'active' ? 'Deactivate' : 'Activate for ranking'}</button></div>)}</details></section>
-}
-
 export default function App() {
   const [user, setUser] = useState<w.User>()
+  const [booting, setBooting] = useState(true)
+  const [offlineSession, setOfflineSession] = useState(false)
+  const [verifiedAt, setVerifiedAt] = useState(0)
+  const [caps, setCaps] = useState<Record<string, Capabilities>>({})
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [projects, setProjects] = useState<w.Project[]>([])
@@ -474,11 +297,13 @@ export default function App() {
   const [memberRole, setMemberRole] = useState('viewer')
   const activeProject = useRef(project)
   activeProject.current = project
-  const departmental = ['viewer', 'processor', 'reviewer', 'steward', 'admin'].includes(user?.role || '')
-  const fieldworkCapable = ['field', 'processor', 'reviewer', 'steward', 'admin'].includes(user?.role || '')
-  const citizenCapable = user?.role === 'citizen'
-  const writable = ['processor', 'reviewer', 'steward', 'admin'].includes(user?.role || '')
-  const canReview = user?.role === 'reviewer' || user?.role === 'steward' || user?.role === 'admin'
+  const capabilities = caps[project]
+  const departmental = !!capabilities?.read_departmental && !offlineSession
+  const fieldworkCapable = !!capabilities?.fieldwork
+  const citizenCapable = !!capabilities?.citizen_records && !offlineSession
+  const writable = !!capabilities?.process && !offlineSession
+  const canReview = !!capabilities?.review && !offlineSession
+  const canCreate = !offlineSession && ['processor', 'reviewer', 'steward', 'admin'].includes(user?.role || '')
   const path = w.projectPath(project)
   const refresh = useCallback(async () => {
     if (!project) return
@@ -492,22 +317,50 @@ export default function App() {
     if (activeProject.current !== project) return
     setDatasets(ds); setParcels(entities); setVersions(publications)
     setEvidence([...matches.map(e => ({ ...e, target: 'match' as const })), ...changes.map(e => ({ ...e, target: 'change' as const })), ...conflicts.map(e => ({ ...e, target: 'conflict' as const }))])
-    const loaded = (await Promise.all(ds.map(async d => (await w.get<w.Feature[]>(`${w.projectPath(project)}/datasets/${d.id}/features`)).map(f => ({ ...f, dataset_id: d.id, dataset_name: d.name }))))).flat()
+    const loaded = (await Promise.all(ds.map(async d => (await w.datasetFeatures(project, d.id)).map(f => ({ ...f, dataset_id: d.id, dataset_name: d.name }))))).flat()
     if (activeProject.current === project) setFeatures(loaded)
   }, [project, user, departmental])
   const run = useCallback((action: () => Promise<void>) => { setBusy(true); setError(''); setNotice(''); void action().catch(e => setError(e instanceof Error ? e.message : String(e))).finally(() => setBusy(false)) }, [])
   useEffect(() => { if (project) { setSelected(''); setDatasetId(''); setValidation(undefined); setPair({ before: '', after: '' }); run(refresh) } }, [project, refresh, run])
+  const restore = useCallback(async () => {
+    const cached = cachedSession()
+    try {
+      if (!localStorage.getItem('geosyncai_token')) { setBooting(false); return }
+      if (tokenExpiry() <= Date.now()) throw new Error('Session expired. Sign in again; device drafts are retained.')
+      const current = await w.get<w.User>('/auth/me')
+      const ps = await w.get<w.Project[]>('/projects')
+      const chosen = ps.some(p => p.id === activeProject.current) ? activeProject.current : ps.some(p => p.id === cached?.project) ? cached!.project : ps[0]?.id || ''
+      const verified = chosen ? await w.get<Capabilities>(`${w.projectPath(chosen)}/capabilities`) : undefined
+      setUser(current); setProjects(ps); setOfflineSession(false); setVerifiedAt(Date.now()); setCaps(verified ? { [chosen]: verified } : {})
+      setProject(chosen)
+      if (current.role === 'field' || current.role === 'citizen') setView('fieldwork')
+    } catch (e) {
+      if (e instanceof api.ApiError && e.status === 0 && !navigator.onLine && cached) {
+        setUser(cached.user); setProjects(cached.projects); setProject(cached.project); setCaps(cached.capabilities); setVerifiedAt(cached.verifiedAt); setOfflineSession(true); setView('fieldwork')
+      } else { clearSession(); setUser(undefined); setProject(''); setCaps({}); setError(String(e)) }
+    } finally { setBooting(false) }
+  }, [])
+  useEffect(() => { void restore(); const online = () => { void restore() }; window.addEventListener('online', online); return () => window.removeEventListener('online', online) }, [restore])
+  useEffect(() => {
+    if (!project || !user || offlineSession) return
+    let active = true
+    void w.get<Capabilities>(`${w.projectPath(project)}/capabilities`).then(value => { if (active) setCaps(previous => ({ ...previous, [project]: value })) }).catch(e => { if (active) { setCaps({}); setError(String(e)); setView('overview') } })
+    return () => { active = false }
+  }, [project, user, offlineSession])
+  useEffect(() => { if (user && !offlineSession && verifiedAt) saveSession(user, projects, project, caps, verifiedAt) }, [user, projects, project, caps, offlineSession, verifiedAt])
+  useEffect(() => {
+    if (!user) return
+    const timer = window.setInterval(() => { if (tokenExpiry() <= Date.now() || (offlineSession && !cachedSession())) { clearSession(); setUser(undefined); setCaps({}); setProject(''); setFeatures([]); setDatasets([]); setParcels([]); setEvidence([]); setError('Session expired. Reconnect and sign in; drafts remain retained.') } }, 15000)
+    return () => clearInterval(timer)
+  }, [user, offlineSession])
   const login = async () => {
     const result = await w.post<{ access_token: string; user: w.User }>('/auth/token', { username, password })
-    localStorage.setItem('geosyncai_token', result.access_token); setUser(result.user)
-    const ps = await w.get<w.Project[]>('/projects'); setProjects(ps); setProject(ps[0]?.id || '')
+    localStorage.setItem('geosyncai_token', result.access_token)
+    await restore(); setPassword('')
   }
   const logout = () => {
-    const pending = Object.keys(localStorage).some(key => key.startsWith('geosyncai-field-queue-') && (() => { try { return (JSON.parse(localStorage.getItem(key) || '[]') as unknown[]).length > 0 } catch { return true } })())
-    if (pending) { setError('Queued field evidence must be synced, exported, or deliberately cleared before logout.'); setView('fieldwork'); return }
-    Object.keys(localStorage).filter(key => key.startsWith('geosyncai-field-') || key.startsWith('geosyncai-project-revision-')).forEach(key => localStorage.removeItem(key))
-    localStorage.removeItem('geosyncai_token'); setUser(undefined); setProject(''); setDatasets([]); setFeatures([]); setEvidence([]); setNotice(''); setError('')
-    void navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_SHELL_CACHE' })
+    clearSession(); setUser(undefined); setProject(''); setProjects([]); setCaps({}); setOfflineSession(false); setDatasets([]); setFeatures([]); setEvidence([]); setParcels([]); setVersions([]); setNotice(''); setError(''); setUsername(''); setPassword(''); setView('overview')
+    // Retain account-scoped unsynced evidence. Another account cannot render it.
   }
   const selectedEvidence = evidence.find(e => e.id === selected)
   const selectedDataset = datasets.find(d => d.id === datasetId)
@@ -530,11 +383,12 @@ export default function App() {
     finally { await refresh() }
     setNote(''); setValidation(undefined); setNotice('Review decision saved')
   })
+  if (booting) return <main className="login-page"><p role="status">Restoring workspace session…</p></main>
   if (!user) return <main className="login-page"><div className="login-art"><Brand /><div className="art-copy"><p className="eyebrow">LAND DATA HARMONIZATION</p><h1>Align the data.<br /><em>Explain the match.</em></h1><p>Reviewable evidence behind every parcel decision.</p></div><p>GeoSyncAI · SIH26013 · Git Good</p></div>
     <div className="login-panel"><form className="login-form" onSubmit={e => { e.preventDefault(); run(login) }}><Brand /><h2>Officer workspace</h2><label>Username<input required value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" /></label>
       <label>Password<input required type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" /></label>{error && <div role="alert" className="error-banner">{error}</div>}
       <button className="button button-primary button-wide" disabled={busy}>{busy ? 'Connecting…' : 'Sign in to workspace'}</button><p>Local demonstration accounts must be explicitly seeded. All workspace actions use the API.</p></form></div></main>
-    const availableViews = (Object.keys(titles) as View[]).filter(v => departmental || v === 'overview' || (v === 'fieldwork' && (fieldworkCapable || citizenCapable)))
+    const availableViews = (Object.keys(titles) as View[]).filter(v => departmental || v === 'overview' || (v === 'fieldwork' && (fieldworkCapable || citizenCapable)) || (v === 'queries' && fieldworkCapable && !offlineSession))
    return <div className="app-shell"><aside className="sidebar"><div className="sidebar-brand"><Brand /></div><div className="workspace-switcher"><label>Project<select aria-label="Project" value={project} onChange={e => setProject(e.target.value)}><option value="">Select project</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label></div>
      <nav className="sidebar-nav">{availableViews.map(v => <button key={v} className={view === v ? 'active' : ''} onClick={() => setView(v)}>{titles[v]}</button>)}</nav>
     <div className="sidebar-bottom"><p>{user.username} · {user.role}</p><button className="button button-secondary" onClick={logout}>Sign out</button></div></aside>
@@ -542,24 +396,24 @@ export default function App() {
       <select className="mobile-project" aria-label="Mobile project" value={project} onChange={e => setProject(e.target.value)}><option value="">Select project</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select>
       <button className="button button-secondary mobile-project" onClick={logout}>Sign out</button>
        <select aria-label="Export" defaultValue="" disabled={!departmental || !versions.length} onChange={e => { if (e.target.value) download(e.target.value as api.ExportKind); e.target.value = '' }}><option value="">Export latest version</option>{['geojson', 'gpkg', 'csv', 'lineage', 'quality'].map(kind => <option key={kind}>{kind}</option>)}</select></div></header>
-      <main className="page-content" aria-busy={busy}>{error && <div role="alert" className="error-banner">{error} <button onClick={() => run(refresh)}>Refresh evidence</button></div>}{notice && <p role="status" className="notice-banner">{notice}</p>}{busy && <p role="status">Working…</p>}
+      <main className="page-content" aria-busy={busy}>{error && <div role="alert" className="error-banner">{error} <button onClick={() => run(refresh)}>Refresh evidence</button></div>}{notice && <p role="status" className="notice-banner">{notice}</p>}{busy && <p role="status">Working…</p>}{offlineSession && <p className="notice-banner" role="status">Offline field session · cached assignments expire within 8 hours or at token/assignment expiry. Reconnection requires server authorization.</p>}
       {view === 'overview' && <><div className="welcome-row"><div><p className="eyebrow">{new Date().toLocaleDateString()}</p><h1>Welcome, {user.username}</h1><p>Source records, decisions and publication evidence.</p></div></div>
         <div className="metric-grid">{[['Sources', datasets.length], ['Records', features.length], ['Open review', open.length], ['Published versions', versions.length]].map(([name, value]) => <section key={name} className="metric-card"><div className="metric-value">{value}</div><div className="metric-label">{name}</div></section>)}</div>
-        <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { const p = await w.post<w.Project>('/projects', { name: newProject }); setProjects(await w.get<w.Project[]>('/projects')); setProject(p.id); setNewProject('') }) }}><h3>Create study-area project</h3><label>Project name<input required value={newProject} onChange={e => setNewProject(e.target.value)} /></label><button className="button button-primary" disabled={!writable || busy}>Create project</button></form>
+        <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { const p = await w.post<w.Project>('/projects', { name: newProject }); setProjects(await w.get<w.Project[]>('/projects')); setProject(p.id); setNewProject('') }) }}><h3>Create study-area project</h3><label>Project name<input required value={newProject} onChange={e => setNewProject(e.target.value)} /></label><button className="button button-primary" disabled={!canCreate || busy}>Create project</button></form>
          {departmental && project && <><section className="panel inspector"><h3>Processing policy</h3><p>Only explicit reviewer-approved baseline selections publish. Pending changes affecting selected parcels block publication. Rejected changes retain the approved baseline. Unselected records are reported as exclusions.</p>
           <PolicyEditor project={project} enabled={canReview} run={run} />
           <button className="button button-secondary" disabled={!writable || busy} onClick={() => run(async () => { await w.post(`${path}/bootstrap-synthetic?count=25`); await refresh(); setNotice('Explicit synthetic pair generated') })}>Generate labelled synthetic sources</button></section>
-          {user.role === 'admin' && <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { await w.post(`${path}/members`, { username: member, project_role: memberRole }); setNotice('Membership saved') }) }}><h3>Project membership</h3><label>Member username<input required value={member} onChange={e => setMember(e.target.value)} /></label><label>Project role<select value={memberRole} onChange={e => setMemberRole(e.target.value)}>{['viewer','processor','reviewer'].map(role => <option key={role}>{role}</option>)}</select></label><button className="button button-primary">Save membership</button></form>}</>}
+          {user.role === 'admin' && <form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { await w.post(`${path}/members`, { username: member, project_role: memberRole }); setNotice('Membership saved') }) }}><h3>Project membership</h3><label>Member username<input required value={member} onChange={e => setMember(e.target.value)} /></label><label>Project role<select value={memberRole} onChange={e => setMemberRole(e.target.value)}>{['viewer','processor','reviewer','steward','field','citizen'].map(role => <option key={role}>{role}</option>)}</select></label><button className="button button-primary">Save membership</button></form>}</>}
       </>}
         {view === 'datasets' && departmental && project && <><h1>Dataset registry</h1><form className="panel inspector" onSubmit={e => { e.preventDefault(); run(async () => { if (!file) throw new Error('Choose a source file'); JSON.parse(accuracy); JSON.parse(provenance); const d = await w.upload(project, file, capture, source, { license, sourceVersion, namespace, accessClassification, accuracy, provenance }); await refresh(); setDatasetId(d.id); setNotice('Upload preserved and inspected') }) }}>
           <label>Dataset file<input type="file" accept=".geojson,.json,.csv,.gpkg,.zip" required onChange={e => setFile(e.target.files?.[0])} /></label><label>Capture date<input type="date" value={capture} onChange={e => setCapture(e.target.value)} /></label><label>Source organization<input value={source} onChange={e => setSource(e.target.value)} /></label><label>License / legal classification<input value={license} onChange={e => setLicense(e.target.value)} placeholder="Departmental license or public notice" /></label><label>Access classification<select value={accessClassification} onChange={e => setAccessClassification(e.target.value)}><option>internal</option><option>public</option><option>restricted</option></select></label><label>Accuracy metadata JSON<input value={accuracy} onChange={e => setAccuracy(e.target.value)} placeholder='{"horizontal_m":0.5,"method":"survey"}' /></label><label>Provenance JSON<input value={provenance} onChange={e => setProvenance(e.target.value)} placeholder='{"source_url":"documented-or-null"}' /></label><label>Source version<input value={sourceVersion} onChange={e => setSourceVersion(e.target.value)} placeholder="2026.1" /></label><label>Administrative namespace JSON<input value={namespace} onChange={e => setNamespace(e.target.value)} placeholder='{"ward":"W-1","village":"…"}' /></label><button className="button button-primary" disabled={!writable || busy}>Upload dataset</button></form>
-         <RegistryTools project={project} features={features} writable={writable} run={run} />
+         <RegistryTools key={`${project}-${user.id}`} project={project} features={features} matches={evidence.filter(e => e.target === 'match')} writable={writable} canReview={canReview} refreshProject={refresh} run={run} />
         <section className="panel inspector"><h3>Source pair</h3>{(['before','after'] as const).map(side => <label key={side}>{side === 'before' ? 'Baseline' : 'Comparison'}<select aria-label={side === 'before' ? 'Baseline' : 'Comparison'} value={pair[side]} onChange={e => setPair({ ...pair, [side]: e.target.value })}><option value="">Choose dataset</option>{datasets.map(d => <option key={d.id} value={d.id}>{d.name} · {d.capture_date || 'Undated'}</option>)}</select></label>)}
           <button className="button button-primary" disabled={!writable || busy} onClick={() => process('match')}>Generate matches</button> <button className="button button-secondary" disabled={!writable || busy} onClick={() => process('change_detection')}>Compare dated snapshots</button>
           {job && <div role="status">{job.job_type}: {job.status} {job.error} {job.id}</div>}</section>
         <section className="panel inspector">{datasets.map(d => <div className="source-row" key={d.id}><button className="text-button" onClick={() => setDatasetId(d.id)}>{d.name}</button><span>{d.record_count} records · {d.status} · {d.declared_crs || 'Unknown CRS'}</span><button className="button button-secondary" disabled={!writable || busy} onClick={() => run(async () => { await w.runJob(project, 'topology', { dataset_id: d.id }, setJob); await refresh() })}>Check topology</button></div>)}</section>
-         {selectedDataset && <DatasetInspector key={selectedDataset.id} project={project} dataset={selectedDataset} writable={writable} reviewable={canReview} refresh={refresh} run={run} />}<RasterPanel project={project} writable={writable} run={run} /></>}
-        {view === 'datasets' && departmental && project && <GroundControlPanel project={project} datasets={datasets} writable={writable} canReview={canReview} run={run} />}
+         {selectedDataset && <DatasetInspector key={selectedDataset.id} project={project} dataset={selectedDataset} writable={writable} reviewable={canReview} refresh={refresh} run={run} />}<RasterPanel key={`${project}-${user.id}`} project={project} writable={writable} run={run} /></>}
+        {view === 'datasets' && departmental && project && <GroundControlPanel key={`${project}-${user.id}`} project={project} datasets={datasets} writable={writable} canReview={canReview} refresh={refresh} run={run} />}
        {(view === 'review' || view === 'alerts') && departmental && project && <><h1>{titles[view]}</h1><label>Search evidence<input value={search} onChange={e => setSearch(e.target.value)} /></label><div className="evidence-workspace"><section className="panel inspector evidence-list">
         {evidence.filter(e => (view !== 'alerts' || e.target === 'change') && format(e).toLowerCase().includes(search.toLowerCase())).map(e => <button key={e.id} className={`proposal-list-row ${selected === e.id ? 'selected' : ''}`} onClick={() => { setSelected(e.id); setNote('') }}><span>{e.target} · {e.change_type || label(features.find(f => f.id === e.left_feature_id))}</span><span>{e.status}</span></button>)}
         {!evidence.length && <p>No processing evidence yet.</p>}</section><section><ParcelMap features={features} selected={selectedEvidence} onSelect={id => { const e = evidence.find(e => [e.left_feature_id,e.right_feature_id,e.source_feature_id,e.comparison_feature_id].includes(id)); if (e) setSelected(e.id) }} />
@@ -578,10 +432,10 @@ export default function App() {
         {versions.map(v => <section className="panel inspector" key={v.id}><h2>Version {v.version}</h2><p>{new Date(v.created_at).toLocaleString()}</p><details><summary>View lineage</summary><Json value={v.lineage_manifest} /></details>
           <button className="button button-secondary" onClick={() => run(async () => { await api.downloadExport(project, 'lineage', v.id) })}>Download this version's lineage</button>
            <button className="button button-secondary" disabled={!canReview || busy} onClick={() => run(async () => { await w.post(`${path}/versions/${v.id}/rollback`); await refresh(); setNotice('Traceable rollback version created') })}>Restore as new version</button></section>)}</>}
-        {view === 'geometry' && departmental && project && <><h1>Boundary editor</h1><GeometryEditor project={project} parcels={parcels} writable={writable} canReview={canReview} refresh={refresh} run={run} /></>}
-        {view === 'queries' && departmental && project && <><h1>Read-only query workspace</h1><QueryPanel project={project} run={run} /></>}
-        {view === 'compliance' && departmental && project && <><h1>Compliance screening</h1><CompliancePanel project={project} parcels={parcels} writable={writable} canReview={canReview} run={run} /></>}
-        {view === 'fieldwork' && project && (user.role === 'citizen' ? <CitizenPanel project={project} run={run} /> : <><FieldworkPanel project={project} user={user} run={run} />{canReview && <OperationsPanel project={project} parcels={parcels} run={run} />}</>)}
+        {view === 'geometry' && departmental && project && <><h1>Boundary editor</h1><GeometryEditor key={`${project}-${user.id}`} project={project} parcels={parcels} writable={writable} canReview={canReview} refresh={refresh} run={run} /></>}
+        {view === 'queries' && (departmental || fieldworkCapable) && !offlineSession && project && <><h1>Read-only query workspace</h1><QueryPanel key={`${project}-${user.id}`} project={project} fieldOnly={!departmental} run={run} /></>}
+        {view === 'compliance' && departmental && project && <><h1>Compliance screening</h1><CompliancePanel key={`${project}-${user.id}`} project={project} parcels={parcels} writable={writable} canReview={canReview} run={run} /></>}
+        {view === 'fieldwork' && project && (fieldworkCapable || citizenCapable) && (user.role === 'citizen' ? <CitizenPanel key={`${project}-${user.id}`} project={project} run={run} /> : <><FieldworkPanel key={`${project}-${user.id}`} project={project} user={user} run={run} />{canReview && <OperationsPanel key={`${project}-${user.id}`} project={project} parcels={parcels} run={run} />}</>)}
       {!project && view !== 'overview' && <p>Create or select a project in Overview.</p>}
       </main><footer className="app-footer">GeoSyncAI · SIH26013 · Team Git Good / 151551 · Review support, not legal certification</footer></div></div>
 }

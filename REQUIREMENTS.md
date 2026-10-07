@@ -38,22 +38,31 @@ named acceptance path ran; it is not proof of every production edge case.
 | Synthetic evaluation pack | Generated/measured | ~1,000 parcels, separate answer key, checksums/vertices/dependencies/results in docs |
 | Source registry, explicit multi-source evidence and bilingual dictionary | Implemented core | Hash-guarded metadata UI, revisioned Hindi/English terms/templates, three-source acceptance materializes links/selections when explicitly requested, competing values remain visible; no ownership adjudication |
 | Supervised ranker and calibration artifacts | Tested core | Group-aware labeled logistic ranker, held-out validation activation gate, real inference routing when activated, deterministic fallback, uncalibrated-score labeling and reliability metrics; no probability claim without a calibrator |
-| Offline assigned fieldwork PWA | Implemented core | Installable shell, bounded assignments, GPS/photo/note queue, idempotent sync and revision-conflict draft retention; browser storage limits remain |
-| Structured Hindi/English read-only queries | Implemented core | Whitelisted parser/plans for conflicts, missing links, dated changes and nearby tasks; no arbitrary SQL or mutation |
+| Offline assigned fieldwork PWA | Tested production reload/sync | Installable shell, bounded assignments, GPS/photo/note queue, idempotent sync and revision-conflict draft retention; browser storage limits remain |
+| Structured Hindi/English read-only queries | Tested authorization/filters | Whitelisted parser/plans for conflicts, missing links, dated changes and nearby tasks; no arbitrary SQL or mutation |
 | Height-aware 3D display and permissioned raster registry | Implemented/tested metadata preview | Genuine GeoTIFF/rasterio CRS/bounds/transform/dimensions/bands/resolution/nodata/hash inspection, bounded PNG preview, classification gates and validated-height-only extrusion; tiled reprojection/terrain remains roadmap |
 | Compliance rules and citizen access | Implemented core | Versioned rule inputs/formulas, insufficient-information gates, explicit field grants and audited cases; demo rules are not legal determinations |
 | Independent lineage verification and OGC API Features | Implemented/tested core | Canonical manifest/output/source-byte verification including rollback, standalone CLI, collection/item/bbox/version/pagination access and truthful conformance; same-database administrators are not excluded |
 | Accuracy/effort objectives | Targets, not generally achieved claims | Scoped synthetic metrics only; schema-suggestion accuracy/manual savings and real cadastral accuracy are not measured |
 
-## Actual verification
+## Actual verification — local delivery, 7 October 2026
 
-- **38 backend tests passed** in the fresh Python 3.12/PostGIS/Redis/Celery Compose environment; no skips.
-- Production-built frontend through Nginx/Chromium smoke passed: admin login, new geometry/query/compliance views, no page errors and 390px responsive-width check. The full upload → publish → export → refresh workflow also passed.
-- Separate-stack restore probe passed: restored health/frontend, project/version IDs, exported GeoJSON SHA-256, and raw-upload SHA-256 matched the source.
-- Frontend typecheck/build passed; MapLibre bundle warning remains.
-- Latest synthetic evaluation: **10.8792 seconds** for 1,000 parcels, including simulated review; candidate recall **99.6994%**, top precision **99.8996%**, top recall **99.6994%**, abstention **0.6%**, conflict precision/recall **100%/100%**, geometry-change F1 **1.0**, publication subset lineage **100%**. Python 3.14 run had Fiona/rasterio package metadata unavailable; container dependencies are pinned and tested.
-- Detailed commands, environment versions, denominators and limitations:
-  [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+- Fresh full backend suite: **49 passed, 2 skipped**. The skips require unavailable
+  native PostGIS and Redis/Celery services. This Windows acceptance used Python 3.12,
+  SQLite and real installed geospatial dependencies.
+- Browser acceptance: **3 passed** (officer workflow plus two production repair
+  workflows). Final targeted production rerun after reconnect-state correction:
+  **2 passed**, including actual pointer drag/undo and a map-drawn cut.
+- Frontend typecheck/build, Python compilation, Ruff F-only checks and diff-check
+  passed. The MapLibre chunk-size performance warning remains.
+- Local production launcher: real HTTP health/frontend and authenticated demo
+  registry verified. Its data is isolated from existing backend databases/uploads.
+- Full service-stack acceptance is configured in `.github/workflows/acceptance.yml`
+  and must be run on the uploaded revision; older main-branch container/CI evidence
+  is historical, not proof of the new working tree.
+- Synthetic evaluation results in `docs/VERIFICATION.md` remain historical scoped
+  fixture measurements and were not reclassified as real cadastral accuracy.
+- Detailed current commands, behavior and limitations: `docs/FINAL_ACCEPTANCE.md`.
 
 ## Roadmap / unavailable
 

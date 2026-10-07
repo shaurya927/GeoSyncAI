@@ -1,142 +1,98 @@
-# GeoSyncAI final acceptance record
+# Final acceptance — 7 October 2026
 
-## Revision and scope
+## Delivered revision
 
-- Repository: `GeoSyncAI`, branch `main`.
-- Baseline inspected: `7a93faec449064ad684ceade18d009d44352fe55`.
-- Working tree during this record: implementation changes are local and uncommitted.
-- Remote fetch was successful over `git@github.com:shaurya927/GeoSyncAI.git`.
-- No push, deployment, or submission was performed.
-- Existing `backend/geosyncai.db`, `backend/storage`, and user volumes were not used as fixtures.
+Local branch: `codex/submission-fixes-20261007`, based on remote `main`
+`10eb59aed7b4cf583e3169f92437c773c315be11`. This acceptance record was captured
+locally before GitHub publication, which the user subsequently authorized.
+No public deployment or SIH submission was performed. The delivery ZIP contains
+editable source and the verified production frontend. Its package manifest records
+SHA-256 hashes of every included file.
 
-## Environment
+Existing backend databases, storage directories and user volumes were preserved.
+Backend/browser checks used disposable databases and storage. The local preview
+uses its own `.local-demo/` directory, which is excluded from the ZIP.
 
-| Component | Environment |
+## Repaired behavior
+
+- Every structured query checks project/account capabilities before reading source
+  tables. Departmental classifications apply to query rows, registries, evidence,
+  canonical parcels and processing inputs. Ward/date/bbox/metre-radius filters
+  actually filter the results before pagination. Nearby field queries expose only
+  current bounded assignments, not departmental or unpublished citizen records.
+- Ground-control fitting and independent checkpoint residuals are reported in
+  metres for both geographic and projected/feet target coordinates. Finite
+  coordinate ranges, source CRS consistency, checkpoint threshold, source hash,
+  revision and validated control coverage gate approval. Extrapolation is blocked.
+  A linked aligned dataset preserves original bytes/coordinates/declared CRS and
+  inherits its schema mapping.
+- A previously verified field account can reload the production PWA offline and
+  reopen its scoped assignments, references and drafts. The lease is bounded by
+  eight hours and token/assignment expiry. Sync rechecks the server account and
+  project permission. Revocation does not fall back to cached authority. Quota
+  failure retains the form; sign-out locks access and retains unsynced evidence
+  for the same account. Explicit resubmission records a rationale/current revision.
+- True polygon split/intersection and union preserve concavity, holes and lineage.
+  The editor supports drawn cuts, pointer-dragged vertices, metric-tolerance
+  snapping, coupled coincident shared-edge vertices, coordinate editing, undo,
+  measured previews, neighbor impact checks and approve/reject/defer review.
+  Coverage, overlap, stale-boundary and changed-policy checks remain on the server.
+- Three-source reconciliation has a comparison table and explicit boundary,
+  default attribute and per-field source choices. Identity acceptance and baseline
+  approval remain separate choices. Accepted/deferred/rejected decisions are
+  revisioned; a reviewer rationale is required. Reviewed labels/training/activation
+  are also connected to the optional uncalibrated ranker UI.
+- Two-band GeoTIFF previews now encode valid RGB PNG rows. Compliance rejects
+  incompatible length/area units, nonfinite measurements and malformed area ratios.
+  Dataset pages are loaded explicitly beyond the former first 500 records.
+
+## Fresh checks on this working tree
+
+Environment: Windows, Python 3.12.14, Node 24.19.0, Playwright Chromium 153,
+SQLite/local processing, installed Fiona/rasterio/Shapely/PROJ dependencies.
+Recommended deployment versions remain Python 3.12 and Node 22.
+
+| Check | Result |
 |---|---|
-| Local system | WSL2 Linux x86_64, Python 3.14.4 |
-| Pinned application container | Python 3.12, Node 22, FastAPI 0.142.2, SQLAlchemy 2.1.3, Fiona 1.10.1, rasterio 1.4.3, Shapely 2.1.2, PROJ/pyproj 3.8.0 |
-| Services | PostgreSQL/PostGIS 16/3.4 image, Redis 7, Celery 5.6.3, Nginx |
-| Compose project | `geosyncai-final-20261007`, disposable volumes/network |
-| Production ports | API `8000`, Nginx frontend `5173` |
-| Browser | Playwright Chromium image `mcr.microsoft.com/playwright:v1.63.0-noble` |
+| `python -m pytest backend/tests -q` | **49 passed, 2 skipped**; 30.52 s |
+| `python -m pytest backend/tests/test_submission_repairs.py -q` | **13 passed**; includes independent new failure regressions |
+| `python -m pytest e2e/test_browser.py e2e/test_submission_repairs.py -q` | **3 passed**; 31.74 s |
+| Final targeted production browser rerun after reconnect-state correction | **2 passed**; 17.04 s; includes pointer drag/undo and drawn cut |
+| `npm --prefix frontend run typecheck` | Passed |
+| `VITE_API_BASE_URL=/api npm --prefix frontend run build` | Passed; prebuilt assets included |
+| `python -m compileall -q backend/app migrations/versions scripts` | Passed |
+| `python -m ruff check backend/app migrations/versions scripts --select F` | Passed |
+| `git diff --check` | Passed |
+| Real local launcher / HTTP API / seeded demo | Health/frontend HTTP 200; 3 demo datasets, stop/restart persistence and raw source hashes verified |
 
-## Exact checks and results
+The officer browser test covers upload, CRS/mapping, identity review, explicit
+baseline, validation, publication, exports, refresh, map/tile behavior and 390px
+viewport. The production repair tests cover offline first reload, queued retention,
+reconnect/revision resubmission, revocation, account switching, expiry, storage quota,
+three-source choices, map-drawn concave split, reviewed merge, dragged vertex/undo,
+coordinate correction, defer/approve, aligned registry refresh and bounded query UI.
+Application APIs are real HTTP calls; no mock processing response was used. The
+external basemap provider is replaced with raster tile fixtures in its browser test.
 
-### Local checks
+## Service boundary and claims
 
-```bash
-python3 -m pytest backend/tests -q
-python3 -m compileall -q backend/app migrations/versions
-PYTHONPATH=/tmp/omnirush/ruff python3 -m ruff check backend/app migrations/versions --select F
-npm --prefix frontend run typecheck
-npm --prefix frontend run build
-git diff --check
-```
+Two backend tests were skipped because native PostGIS and Redis/Celery services
+were not available on this Windows host. This is a local SQLite acceptance result,
+not a fresh PostGIS/Redis acceptance claim. The GitHub workflow runs those service
+checks and now also runs the production repair browser tests. Run that workflow
+on the uploaded revision before a production release. Earlier main-branch CI and
+container reports do not certify these new local edits.
 
-Results:
+The build retains a large MapLibre JavaScript chunk warning (about 1.37 MB before
+gzip). It is a performance warning, not a compilation failure. Browser storage is
+not an encrypted vault; the bounded offline lease cannot learn server revocation
+until reconnect. Snap coordinates are a UI aid; authoritative topology/measurements
+use the server analysis CRS.
 
-- Full system-Python backend suite: **33 passed, 2 failed, 3 skipped**. The two failures are existing Fiona imports unavailable in system Python 3.14; the raster fixture is skipped for the same local dependency boundary. The pinned container suite below is the authoritative geospatial result.
-- Focused defect/workflow suite: **15 passed, 1 skipped** locally; the skip is the genuine raster fixture unavailable in system Python.
-- Compileall, Ruff F-only lint, frontend typecheck, production build, and diff-check: passed.
-- Vite reports the existing large JavaScript chunk warning.
-
-### Pinned PostGIS/Redis/Celery container
-
-```bash
-docker compose -p geosyncai-submission-20261007 up -d --build
-docker compose -p geosyncai-submission-20261007 exec -T api python -m app.seed_demo
-docker cp backend/tests geosyncai-submission-20261007-api-1:/app/tests
-docker compose -p geosyncai-submission-20261007 exec -T \
-  -e TEST_DATABASE_URL=postgresql+psycopg://geosyncai:$POSTGRES_PASSWORD@postgres:5432/geosyncai \
-  -e BROKER_TEST_URL=redis://redis:6379/15 api pytest /app/tests -q
-```
-
-Fresh result after migration `0008_ranker_activation`: **38 passed, 0 skipped**.
-This included the real Redis/Celery worker delivery test, migration upgrade/restart,
-native PostGIS execution, capability/expiry/citizen publication tests, split →
-publish → merge → publish → rollback, genuine GeoTIFF metadata/PNG preview,
-ranker activation, and independent artifact verification.
-
-Compose health/readiness and Alembic head were verified:
-
-```text
-GET /health  -> {"status":"ok","database":"connected"}
-GET /ready   -> {"status":"ready","jobs":"celery"}
-alembic_version -> 0008_ranker_activation
-```
-
-### Production browser
-
-The production frontend was rebuilt into the Compose Nginx image and a Chromium
-smoke ran against `http://127.0.0.1:5173`. It covered seeded admin login,
-Datasets access, Boundary editor, Read-only queries, Compliance screening,
-page-error collection, and a 390px responsive-width check.
-
-Result:
-
-```json
-{"baseUrl":"http://127.0.0.1:5173","responsive":true,"pageErrors":[]}
-```
-
-The broader production workflow script returned:
-
-```json
-{"baseUrl":"http://127.0.0.1:5173","workflow":"upload-publish-export-refresh","features":1,"lineageSources":2,"responsive":true,"pageErrors":[]}
-```
-
-The browser ran from the Playwright container because the host WSL environment
-lacks Chromium shared libraries. The production workflow script
-`e2e/test_production_workflow.mjs` also passed upload → CRS/mapping → matching →
-review → selection → validation → publication → GeoJSON export → refresh, with
-one feature, two lineage sources, no page errors, and no 390px overflow. The
-existing Python workflow remains available for a broader restart/download run.
-
-### Synthetic evaluation
-
-```bash
-PYTHONPATH=backend python3 -m app.benchmark_evaluation \
-  --output /tmp/omnirush/geosyncai-benchmark-20261007 --count 1000
-```
-
-Fresh result:
-
-| Metric | Result |
-|---|---:|
-| Total runtime, including simulated review | 10.8792 s |
-| Ingestion/mapping | 2.2708 s |
-| Matching | 0.7511 s |
-| Topology | 0.1604 s |
-| Snapshot review simulation | 6.7004 s |
-| Candidate recall | 99.6994% |
-| Top-match precision | 99.8996% |
-| Top-match recall | 99.6994% |
-| Uncertainty/abstention fraction | 0.6% |
-| Conflict precision / recall | 100% / 100% |
-| Geometry-change F1 | 1.0 |
-| Publication subset lineage completeness | 100% |
-
-The pack contains 1,000 reference parcels, 1,000 alternate records, 1,001 dated
-comparison records, revenue CSV, duplicate/context IDs, missing/ambiguous/split-like
-cases, invalid/duplicate/overlap geometry, and separate truth/checksums. The answer
-key is not read by application matching. The result is synthetic screening evidence,
-not cadastral accuracy, legal validity, probability calibration, or measured officer
-effort reduction. System Python reported Fiona/rasterio package metadata as absent;
-the pinned container includes and tests both.
-
-## Acceptance gate status
-
-| Gate | Status |
-|---|---|
-| Five reproduced defects | Implemented and regression-tested |
-| Core API authorization/publication/integrity | Passed in pinned backend suite |
-| Production build and Nginx smoke | Passed view smoke and upload → publish → export → refresh workflow; Python restart/download run remains separate |
-| Real PostGIS/Redis/Celery | Passed, 38/38 |
-| Geometry split/merge/rollback | Passed backend integration path; richer vertex/snap editor remains limited |
-| Ground control | Passed backend approval/application; full browser UI and coverage policy need extension |
-| Raster metadata/preview | Passed genuine GeoTIFF container path; tiled reprojection/terrain remains roadmap |
-| Full field offline/reload/account-switch/revocation browser matrix | Not fully verified |
-| Separate-stack database/raw-upload restore | Passed; restored health, frontend, project/version IDs, exported GeoJSON SHA-256, and raw-upload SHA-256 matched |
-| External government identity/legal integrations | Unavailable/roadmap |
-
-The application is not declared fully submission-complete while the explicitly
-unverified field/offline browser matrix and richer map editor remain open.
+This is a submission prototype with actual implemented workflows. Synthetic
+fixtures/metrics are not measured cadastral accuracy or effort savings. Matching
+and optional learned ranking are uncalibrated scores, not correctness probabilities.
+Compliance is screening assistance. Citizen access is explicit frozen grants.
+GNN research, government identity/records integrations, blockchain anchoring,
+photogrammetry, surveyed volumetric twins and capability-based AR are not claimed
+as implemented production integrations.

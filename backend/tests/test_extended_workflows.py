@@ -49,8 +49,10 @@ def test_source_registry_three_source_reconciliation_and_measurement(client, aut
     assert measured.json()["area_m2"] > 0
     controls = client.post(f"/api/projects/{project_id}/ground-control", headers=auth(admin), json={
         "dataset_id": first["id"], "method": "affine", "control_points": [
-            {"source": [0, 0], "target": [1, 2]}, {"source": [1, 0], "target": [2, 2]},
-            {"source": [0, 1], "target": [1, 3]}, {"source": [2, 2], "target": [3, 4], "checkpoint": True}]})
+            {"source": [73, 20], "target": [73.00001, 20.00001]},
+            {"source": [74, 20], "target": [74.00001, 20.00001]},
+            {"source": [73, 21], "target": [73.00001, 21.00001]},
+            {"source": [74, 21], "target": [74.00001, 21.00001], "checkpoint": True}]})
     assert controls.status_code == 200, controls.text
     approved = client.post(f"/api/projects/{project_id}/ground-control/{controls.json()['id']}/approve", headers=auth(admin))
     assert approved.status_code == 200 and approved.json()["status"] == "approved"

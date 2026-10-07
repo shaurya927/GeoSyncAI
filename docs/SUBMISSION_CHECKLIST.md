@@ -13,13 +13,13 @@ Multi-source Geospatial Data for Urban Land Record Management
 | CRS/schema review | Unknown CRS gates spatial processing; confirmed bilingual/template mappings are versioned | Mapping/CRS tests and Dataset UI |
 | Explainable matching | Deterministic spatial/semantic candidates with alternatives, abstention and uncertainty | Synthetic evaluation and review UI |
 | Learned ranking | Reviewed group-aware ranker can be activated for inference only after held-out validation; scores remain uncalibrated | Ranker activation test |
-| Reconciliation | Three independent sources can be accepted into explicit membership and selections; competing values remain visible | Reconciliation tests/UI |
-| Boundary editing | Move/split/merge/shared-edge drafts, undo/cancel and server approval gates | Geometry editor/backend path; advanced vertex snapping is follow-up |
-| Fieldwork PWA | Bounded assignment-scoped offline evidence with idempotency and conflict resubmission | Existing PWA implementation; full browser matrix pending |
+| Reconciliation | Three independent sources can be accepted into explicit membership and selections; competing values remain visible | Production three-source decision/per-field selection browser path |
+| Boundary editing | Move/split/merge/shared-edge drafts, undo/cancel and server approval gates | Production drawn-cut/drag/undo/split/merge browser test and neighbor/stale topology regressions |
+| Fieldwork PWA | Bounded assignment-scoped offline evidence with idempotency and conflict resubmission | Production offline reload/reconnect/revocation/account/expiry/quota browser regression |
 | Citizen access | Explicit, revocable grants return frozen published fields and version provenance | Frozen grant regression |
 | Compliance | Versioned typed screening rules with insufficient-information and not-applicable results | Compliance API/UI |
 | Raster/3D | Genuine GeoTIFF metadata/preview and validated-height-only extrusion | rasterio container test; no surveyed volumetric twin claim |
-| Publication | Immutable candidate fingerprint, manifest/output/source hashes, lineage, exports and rollback verification | 38-test container suite |
+| Publication | Immutable candidate fingerprint, manifest/output/source hashes, lineage, exports and rollback verification | Current backend suite plus publication/browser path; service boundary in final acceptance |
 | Interoperability | Scoped OGC landing, conformance, collections, items, bbox, version and pagination | OGC backend tests |
 
 ## Demo path
@@ -43,4 +43,4 @@ Multi-source Geospatial Data for Urban Land Record Management
 - Raster preview is a bounded source preview; no photogrammetric reconstruction or surveyed 3D digital twin is claimed.
 - Uncalibrated ranking scores are not probabilities.
 - Same-database administrators can replace trusted data and hashes; integrity verification detects ordinary artifact/source changes within its trust boundary.
-- Remaining acceptance work is recorded in `docs/FINAL_ACCEPTANCE.md` and `WORK_PROGRESS.md`.
+- Fresh acceptance evidence and service verification boundaries are recorded in `docs/FINAL_ACCEPTANCE.md` and `WORK_PROGRESS.md`.

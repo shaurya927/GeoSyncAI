@@ -34,6 +34,14 @@ export const projectPath = (id: string) => `/projects/${id}`
 export const get = <T,>(path: string) => request<T>(path)
 export const post = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
 export const patch = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) })
+export async function datasetFeatures(project: string, dataset: string): Promise<Feature[]> {
+  const result: Feature[] = []
+  for (let offset=0; ; offset+=1000) {
+    const page = await get<Feature[]>(`${projectPath(project)}/datasets/${dataset}/features?limit=1000&offset=${offset}`)
+    result.push(...page)
+    if (page.length < 1000) return result
+  }
+}
 export async function upload(project: string, file: File, captureDate: string, source: string, metadata: { license?: string; sourceVersion?: string; namespace?: string; accessClassification?: string; accuracy?: string; provenance?: string } = {}) {
   const body = new FormData()
   body.append('file', file)

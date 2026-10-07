@@ -1,0 +1,51 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "001",
+      "properties": {
+        "parcel_id": "001",
+        "recorded_area": 34000,
+        "area_units": "m2",
+        "ward": "W-1",
+        "village_code": "SYNTHETIC-DEMO"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              73,
+              20
+            ],
+            [
+              73.002,
+              20
+            ],
+            [
+              73.002,
+              20.001
+            ],
+            [
+              73.001,
+              20.001
+            ],
+            [
+              73.001,
+              20.002
+            ],
+            [
+              73,
+              20.002
+            ],
+            [
+              73,
+              20
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

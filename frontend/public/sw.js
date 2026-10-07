@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'geosyncai-shell-'
-const CACHE_NAME = `${CACHE_PREFIX}v2`
+const CACHE_NAME = `${CACHE_PREFIX}v3`
 const SHELL = ['/', '/manifest.webmanifest', '/icon.svg']
 
 function isPublicShellRequest(request) {
@@ -11,7 +11,17 @@ function isPublicShellRequest(request) {
 }
 
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()))
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME)
+    await cache.addAll(SHELL)
+    // The first page may load JS/CSS before this worker controls it. Precache
+    // the production entry assets now so its first offline reload also works.
+    const response = await cache.match('/')
+    const html = await response.text()
+    const assets = [...html.matchAll(/(?:src|href)=["'](\/assets\/[^"']+)["']/g)].map(match => match[1])
+    await cache.addAll([...new Set(assets)])
+    await self.skipWaiting()
+  })())
 })
 
 self.addEventListener('activate', event => {
@@ -21,13 +31,17 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   if (!isPublicShellRequest(event.request)) return
-  event.respondWith(caches.match(event.request).then(cached => {
-    const network = fetch(event.request).then(response => {
-      if (response.ok) caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()))
+  event.respondWith((async () => {
+    try {
+      const response = await fetch(event.request)
+      if (response.ok) { const cache = await caches.open(CACHE_NAME); await cache.put(event.request, response.clone()) }
       return response
-    })
-    return cached || network
-  }))
+    } catch (error) {
+      const cached = await caches.match(event.request)
+      if (cached) return cached
+      throw error
+    }
+  })())
 })
 
 self.addEventListener('message', event => {

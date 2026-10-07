@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 
 class Token(BaseModel):
@@ -162,12 +162,21 @@ class GeometryChangeSetRequest(BaseModel):
     attribute_overrides: dict[str, Any] = Field(default_factory=dict)
     rationale: str = Field(min_length=1, max_length=2000)
     authorization: dict[str, Any] = Field(default_factory=dict)
+    expected_geometry_fingerprint: str | None = None
 
 
 class GeometryDecision(BaseModel):
     decision: Literal["approved", "rejected", "deferred"]
     rationale: str = Field(min_length=1, max_length=2000)
     expected_revision: int = Field(ge=1)
+
+
+class GeometryDraftRequest(BaseModel):
+    operation: Literal["move", "split", "merge", "shared_edge"]
+    parcel_entity_ids: list[str] = Field(min_length=1, max_length=100)
+    cut_line: dict[str, Any] | None = None
+    draft_geometries: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    before_geometries: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class MeasurementRequest(BaseModel):
@@ -183,7 +192,8 @@ class GroundControlRequest(BaseModel):
     method: Literal["translation", "similarity", "affine"] = "affine"
     source_crs: str | None = None
     target_crs: str | None = None
-    max_checkpoint_residual: float = Field(default=1.0, gt=0)
+    max_checkpoint_residual: float = Field(default=1.0, gt=0, allow_inf_nan=False,
+        description="Maximum independent checkpoint error in metres, regardless of target CRS units")
     control_points: list[dict[str, Any]] = Field(min_length=1)
 
 
@@ -195,7 +205,7 @@ class GroundControlApprovalRequest(BaseModel):
 class TrainingExampleRequest(BaseModel):
     proposal_id: str | None = None
     label: Literal[0, 1]
-    features: dict[str, float] = Field(default_factory=dict)
+    features: dict[str, FiniteFloat] = Field(default_factory=dict)
     group_key: str = Field(min_length=1, max_length=255)
     split: Literal["train", "calibration", "validation", "test"] = "train"
     hard_negative: bool = False

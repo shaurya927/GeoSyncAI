@@ -296,12 +296,58 @@ def geometry_measurements(db: Session, parcel_ids: list[str], draft_geometries: 
                 baseline = metric_geometry(before_shapes[draft_id], analysis_crs)
                 max_displacement = max(max_displacement,
                                        baseline.hausdorff_distance(metric_geometry(shape(draft_data), analysis_crs)))
+    # Inserting a cut vertex on an unchanged longitude/latitude edge changes the
+    # chord approximation after projection. Conservation compares the assembled
+    # coverage with redundant collinear vertices removed, not those artifacts.
+    from shapely import union_all
+    before_union = union_all(list(before_shapes.values())).simplify(1e-12, preserve_topology=True)
+    after_union = union_all([shape(g) for g in draft_geometries.values()]).simplify(1e-12, preserve_topology=True)
+    before_metric = metric_geometry(before_union, analysis_crs) if analysis_crs and not before_union.is_empty else before_union
+    after_metric = metric_geometry(after_union, analysis_crs) if analysis_crs and not after_union.is_empty else after_union
+    overlap_m2 = 0.0
+    draft_shapes = [shape(g) for g in draft_geometries.values()]
+    for i, geometry in enumerate(draft_shapes):
+        for other in draft_shapes[i+1:]:
+            intersection = geometry.intersection(other)
+            if not intersection.is_empty and intersection.area:
+                overlap_m2 += metric_geometry(intersection, analysis_crs).area
+    neighbor_impacts = []
+    if entities and analysis_crs:
+        project_id = next(iter(entities.values())).project_id
+        search_bounds = before_union.union(after_union).envelope
+        for neighbor in db.scalars(select(ParcelEntity).where(ParcelEntity.project_id == project_id,
+                               ParcelEntity.status == "active", ~ParcelEntity.id.in_(parcel_ids))):
+            geometry, _ = resolve_canonical_geometry(db, neighbor.id)
+            if geometry is None or not geometry.intersects(search_bounds):
+                continue
+            original_overlap = geometry.intersection(before_union)
+            proposed_overlap = geometry.intersection(after_union)
+            before_overlap = metric_geometry(original_overlap, analysis_crs).area if original_overlap.area else 0.0
+            after_overlap = metric_geometry(proposed_overlap, analysis_crs).area if proposed_overlap.area else 0.0
+            if before_overlap or after_overlap or geometry.touches(before_union) or geometry.touches(after_union):
+                neighbor_impacts.append({"parcel_entity_id": neighbor.id, "before_overlap_m2": before_overlap,
+                                         "after_overlap_m2": after_overlap,
+                                         "new_overlap_m2": max(0.0, after_overlap-before_overlap)})
     return {"before_area_m2": before, "after_area_m2": after, "before_geometries": before_geometries,
             "before_origins": before_origins,
             "area_delta_m2": sum(after.values()) - sum(before.values()),
-            "area_conservation_delta_m2": sum(after.values()) - sum(before.values()),
+            "area_conservation_delta_m2": after_metric.area - before_metric.area,
+            "partition_difference_m2": before_metric.symmetric_difference(after_metric).area,
+            "draft_overlap_m2": overlap_m2,
+            "affected_neighbors": neighbor_impacts,
             "max_displacement_m": max_displacement,
             "analysis_crs": analysis_crs}
+
+
+def geometry_submission_gates(operation, measurements, policy):
+    gates = []
+    if measurements["draft_overlap_m2"] > policy["overlap_tolerance_m2"]:
+        gates.append("Proposed participant boundaries overlap beyond policy tolerance")
+    if any(item["new_overlap_m2"] > policy["overlap_tolerance_m2"] for item in measurements["affected_neighbors"]):
+        gates.append("Edit introduces overlap with an approved neighboring parcel; include/review the neighbor")
+    if operation in {"split", "merge", "shared_edge"} and measurements["partition_difference_m2"] > 0.01:
+        gates.append("Operation must preserve predecessor coverage without gaps or added land (0.01 m² tolerance)")
+    return gates
 
 
 def feature_vector(evidence: dict[str, Any]) -> dict[str, float]:
@@ -388,6 +434,9 @@ def parse_structured_query(query: str) -> dict[str, Any]:
         result["kind"] = "nearby_tasks"
     elif re.search(r"change|परिवर्तन|dated|तिथि", normalized):
         result["kind"] = "dated_changes"
+    ward = re.search(r"(?:ward|वार्ड)\s*[:=]?\s*([\w-]+)", normalized)
+    if ward:
+        result["filters"]["ward"] = ward.group(1)
     return result
 
 
@@ -410,12 +459,15 @@ def validate_compliance_rule(rule_data: dict[str, Any]) -> None:
 
 
 def _convert_units(value: float, source_units: str | None, target_units: str | None) -> float:
+    if not math.isfinite(value):
+        raise ValueError("Measurements must be finite")
     if not source_units or not target_units or source_units == target_units:
         return value
     factors = {"m": 1.0, "metre": 1.0, "metres": 1.0, "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
                "m2": 1.0, "m²": 1.0, "sq_m": 1.0, "ft2": 0.09290304, "sqft": 0.09290304, "sq_ft": 0.09290304}
     source_factor, target_factor = factors.get(source_units.casefold()), factors.get(target_units.casefold())
-    if source_factor is None or target_factor is None:
+    area_units = {"m2", "m²", "sq_m", "ft2", "sqft", "sq_ft"}
+    if source_factor is None or target_factor is None or ((source_units.casefold() in area_units) != (target_units.casefold() in area_units)):
         raise ValueError(f"Unsupported or incompatible units: {source_units} -> {target_units}")
     return value * source_factor / target_factor
 
@@ -444,7 +496,13 @@ def compliance_result(rule: Any, values: dict[str, Any]) -> dict[str, Any]:
     if operation in {"far", "fsi"} and actual is None:
         if values.get("plot_area_m2") in (None, 0):
             return {"status": "insufficient_information", "missing_inputs": ["plot_area_m2"], "rule_id": rule.id}
-        actual = float(values["floor_area_m2"]) / float(values["plot_area_m2"])
+        try:
+            floor, plot = float(values["floor_area_m2"]), float(values["plot_area_m2"])
+            if not math.isfinite(floor) or not math.isfinite(plot) or floor < 0 or plot <= 0:
+                raise ValueError("Invalid area")
+            actual = floor / plot
+        except (TypeError, ValueError, ZeroDivisionError):
+            return {"status": "insufficient_information", "explanation": "Floor/plot areas must be finite; plot area must be positive", "rule_id": rule.id}
         actual_name = "floor_area_m2 / plot_area_m2"
     threshold_units = threshold.get("units")
     input_units = next((item.get("units") for item in (rule.inputs or []) if item.get("name") == actual_name), threshold_units)
@@ -462,8 +520,8 @@ def compliance_result(rule: Any, values: dict[str, Any]) -> dict[str, Any]:
             limit = float(threshold.get("value", threshold.get("max", threshold.get("min"))))
             passed = {"<": actual < limit, "<=": actual <= limit, ">": actual > limit,
                       ">=": actual >= limit, "==": math.isclose(actual, limit, rel_tol=1e-9, abs_tol=1e-9)}[operator]
-    except (TypeError, ValueError, KeyError):
-        return {"status": "insufficient_information", "explanation": "Inputs must be numeric", "rule_id": rule.id}
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return {"status": "insufficient_information", "explanation": "Inputs must be finite numeric measurements with compatible units", "rule_id": rule.id}
     return {"status": "pass" if passed else "potential_violation", "actual": actual, "threshold": limit,
             "operator": operator, "units": threshold.get("units"), "rule_id": rule.id, "rule_version": rule.version,
             "explanation": f"{actual_name}={actual} compared with configured operator {operator} and threshold {limit}"}

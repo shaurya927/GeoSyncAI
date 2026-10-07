@@ -115,7 +115,7 @@ def test_ground_control_checkpoint_is_independent_and_blocks_bad_fit(client, aut
     body = {"dataset_id": dataset["id"], "method": "affine", "source_crs": "EPSG:4326", "target_crs": "EPSG:4326",
             "max_checkpoint_residual": 0.1, "control_points": [
                 {"source": [0, 0], "target": [1, 2]}, {"source": [1, 0], "target": [2, 2]},
-                {"source": [0, 1], "target": [1, 3]}, {"source": [2, 2], "target": [99, 99], "checkpoint": True}]}
+                {"source": [0, 1], "target": [1, 3]}, {"source": [2, 2], "target": [80, 80], "checkpoint": True}]}
     created = client.post(f"/api/projects/{project_id}/ground-control", headers=headers(admin), json=body)
     assert created.status_code == 200, created.text
     assert created.json()["residuals"]["fitting_count"] == 3
